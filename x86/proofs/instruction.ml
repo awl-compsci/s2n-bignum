@@ -240,6 +240,25 @@ let operand_INDUCTION,operand_RECURSION = define_type
   | Memop wordsize bsid";;
 
 (* ------------------------------------------------------------------------- *)
+(* EVEX instruction decorators.                                              *)
+(* ------------------------------------------------------------------------- *)
+
+let evex_masking_INDUCTION,evex_masking_RECURSION = define_type
+ "evex_masking =
+    Unmasked
+  | Merge_mask (3 word)
+  | Zero_mask (3 word)";;
+
+(* Rounding and SAE only concern floating-point arithmetic and are currently dropped. *)
+let evex_brc_INDUCTION,evex_brc_RECURSION = define_type
+ "evex_brc =
+    No_brc
+  | Broadcast";;
+
+let evex_deco_INDUCTION,evex_deco_RECURSION = define_type
+ "evex_deco = Evex_deco evex_masking evex_brc";;
+
+(* ------------------------------------------------------------------------- *)
 (* Instructions.                                                             *)
 (* ------------------------------------------------------------------------- *)
 
@@ -341,6 +360,7 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | VMOVHPD operand operand
    | VMOVSHDUP operand operand
    | VMOVSLDUP operand operand
+   | VPADDB operand operand operand
    | VPADDW operand operand operand
    | VPADDD operand operand operand
    | VPADDQ operand operand operand
@@ -399,6 +419,7 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | VPSUBQ operand operand operand
    | VPSUBW operand operand operand
    | VPTEST operand operand
+   | VPTERNLOGD operand operand operand operand (evex_deco option)
    | VPUNPCKHQDQ operand operand operand
    | VPUNPCKLQDQ operand operand operand
    | VPXOR operand operand operand

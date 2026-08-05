@@ -1811,6 +1811,9 @@ let bytes128 = define
 let bytes256 = define
  `bytes256 addr :((int64->byte),256 word)component = bytes(addr,32) :> asword`;;
 
+let bytes512 = define
+ `bytes512 addr :((int64->byte),512 word)component = bytes(addr,64) :> asword`;;
+
 let BYTES8_ELEMENT = prove
  (`bytes8 = element`,
   REWRITE_TAC[FUN_EQ_THM; COMPONENT_EQ] THEN

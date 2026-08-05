@@ -1759,6 +1759,18 @@ let x86_VMOVSHDUP = new_definition
           (word_zx x) in
         (dest := (word_zx res):N word) s`;;
 
+let x86_VPADDB = new_definition
+  `x86_VPADDB dest src1 src2 (s:x86state) =
+      let (x:N word) = read src1 s
+      and (y:N word) = read src2 s in
+      if dimindex(:N) = 256 then
+        let res:(256)word = simd32 word_add (word_zx x) (word_zx y) in
+        (dest := (word_zx res):N word) s
+      else
+        let res:(128)word = simd16 word_add (word_zx x) (word_zx y) in
+        (dest := (word_zx res):N word) s`;;
+
+
 let x86_VPADDD = new_definition
   `x86_VPADDD dest src1 src2 (s:x86state) =
       let (x:N word) = read src1 s
@@ -2499,6 +2511,60 @@ let x86_VPXOR = new_definition
         let z = word_xor x y in
         (dest := (z:N word)) s`;;
 
+(* Get the mask encoded by the `a` field in the encoding. *)
+(* If `a` is 0, that means no masking applies; we return a word of all 1's.*)
+(* Otherwise, we read the `a`-th mask register and use that as our mask. *)
+let evex_mask = new_definition
+ `evex_mask (k:3 word) (s:x86state) : 64 word =
+  if k = word 0 then word_not (word 0)
+  else read (maskregisters :> element k) s`;;
+
+(* The above mask is per lane. This function expands that to per bit. *)
+let dword_expand_mask = new_definition
+ `(dword_expand_mask:64 word->N word) m =
+  (* word_of_bits <set> constructs a word whose i-th bit is 1 if and only if i is in <set>. *)
+  word_of_bits {i | i < dimindex(:N) /\ bit (i DIV 32) m}`;;
+
+(* This function applies the EVEX mask. *)
+let apply_evex_masking_dword = new_definition
+ `apply_evex_masking_dword masking (result:N word) (old:N word) (s:x86state) : N word =
+  match masking with
+    Unmasked -> result
+  (* Merge mask is such that if the mask bit is 1, we use the corresponding new result bit;
+     otherwise, we use the old bit before the operaion. *)
+  | Merge_mask k ->
+      let m = dword_expand_mask (evex_mask k s) : N word in
+      word_or (word_and m result) (word_and (word_not m) old)
+  (* Zero mask is such that if the mask bit is 1, we use the corresponding new result bit;
+     otherwise, we use 0. *)
+  | Zero_mask k ->
+      let m = dword_expand_mask (evex_mask k s) : N word in
+      word_and m result`;;
+
+(* The imm8 operand encodes an 3-DNF boolean formula. There are 8 possible clauses for a 
+   3-DNF formula of 3 variables. Each bit in the imm8 corresponds to whether each of the
+   8 clauses is present in the 3-DNF formula. *)
+(* Or maybe the truth-table view is simpler. The 8 bits of the imm8 simply encode the struct
+   table of the boolean formula being applied to the three operands. *)
+let x86_VPTERNLOGD = new_definition
+ `x86_VPTERNLOGD dest src2 src3 ibyte masking (s:x86state) =
+        let a:N word = read dest s
+        and b:N word = read src2 s
+        and c:N word = read src3 s
+        and imm:byte = read ibyte s in
+        let t0 = if bit 0 imm then word_and (word_not a) (word_and (word_not b) (word_not c)) else word 0
+        and t1 = if bit 1 imm then word_and (word_not a) (word_and (word_not b) c) else word 0
+        and t2 = if bit 2 imm then word_and (word_not a) (word_and b (word_not c)) else word 0
+        and t3 = if bit 3 imm then word_and (word_not a) (word_and b c) else word 0
+        and t4 = if bit 4 imm then word_and a (word_and (word_not b) (word_not c)) else word 0
+        and t5 = if bit 5 imm then word_and a (word_and (word_not b) c) else word 0
+        and t6 = if bit 6 imm then word_and a (word_and b (word_not c)) else word 0
+        and t7 = if bit 7 imm then word_and a (word_and b c) else word 0 in
+        let z = word_or t0 (word_or t1 (word_or t2 (word_or t3
+                (word_or t4 (word_or t5 (word_or t6 t7)))))) in
+        (* The EVEX mask is applied before writing back to the destination. *)
+        (dest := apply_evex_masking_dword masking z a s) s`;;
+
 (* Only deal with register-register exchange *)
 let x86_XCHG = new_definition
  `x86_XCHG dest src s =
@@ -2559,6 +2625,10 @@ let GPR = define
 
 (*** The zero-top-on-write behavior when VEX-encoded, which we assume ***)
 
+let SIMD512 = define
+ `SIMD512 (Simdreg reg Full_512) =
+      simdregisters :> element reg`;;
+
 let SIMD256 = define
  `SIMD256 (Simdreg reg Lower_256) =
       simdregisters :> element reg :> zerotop_256`;;
@@ -2589,6 +2659,13 @@ let bsid_semantics = define
 (* Note: this is in 64-bit mode only. Of course things are different in      *)
 (* other modes; particularly the "zerotop" stuff does not apply then.        *)
 (* ------------------------------------------------------------------------- *)
+
+let OPERAND512 = define
+ `OPERAND512 (Simdregister r) s =
+        (if simdregister_size r = 512 then SIMD512 r else ARB) /\
+  OPERAND512 (Memop w ea) s =
+       (if w = Word512 then memory :> bytes512 (bsid_semantics ea s)
+        else ARB)`;;
 
 let OPERAND256 = define
  `OPERAND256 (Simdregister r) s =
@@ -3420,6 +3497,14 @@ let x86_execute = define
         (\s. (match operand_size dest with
           256 -> x86_VMOVSLDUP (OPERAND256 dest s) (OPERAND256 src s)
         | 128 -> x86_VMOVSLDUP (OPERAND128 dest s) (OPERAND128 src s)) s)) s
+    | VPADDB dest src1 src2 ->
+        (add_load_event src1 s ,, add_load_event src2 s ,,
+         add_store_event dest s ,,
+       (\s. (match operand_size dest with 
+          256 -> x86_VPADDB (OPERAND256 dest s) (OPERAND256 src1 s)
+                            (OPERAND256 src2 s)
+        | 128 -> x86_VPADDB (OPERAND128 dest s) (OPERAND128 src1 s)
+                            (OPERAND128 src2 s)) s)) s
     | VPADDD dest src1 src2 ->
         (add_load_event src1 s ,, add_load_event src2 s ,,
          add_store_event dest s ,,
@@ -3812,6 +3897,39 @@ let x86_execute = define
                             (OPERAND8 imm8 s)
         | 128 -> x86_VPSRLW (OPERAND128 dest s) (OPERAND128 src s)
                             (OPERAND8 imm8 s)) s)) s
+    | VPTERNLOGD dest src2 src3 imm8 NONE ->
+        (add_load_event dest s ,, add_load_event src2 s ,,
+         add_load_event src3 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VPTERNLOGD (OPERAND512 dest s) (OPERAND512 src2 s)
+                                (OPERAND512 src3 s) (OPERAND8 imm8 s) Unmasked s
+        | 256 -> x86_VPTERNLOGD (OPERAND256 dest s) (OPERAND256 src2 s)
+                                (OPERAND256 src3 s) (OPERAND8 imm8 s) Unmasked s
+        | 128 -> x86_VPTERNLOGD (OPERAND128 dest s) (OPERAND128 src2 s)
+                                (OPERAND128 src3 s) (OPERAND8 imm8 s) Unmasked s) s)) s
+    | VPTERNLOGD dest src2 src3 imm8 (SOME (Evex_deco masking No_brc)) ->
+        (add_load_event dest s ,, add_load_event src2 s ,,
+         add_load_event src3 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VPTERNLOGD (OPERAND512 dest s) (OPERAND512 src2 s)
+                                (OPERAND512 src3 s) (OPERAND8 imm8 s) masking s
+        | 256 -> x86_VPTERNLOGD (OPERAND256 dest s) (OPERAND256 src2 s)
+                                (OPERAND256 src3 s) (OPERAND8 imm8 s) masking s
+        | 128 -> x86_VPTERNLOGD (OPERAND128 dest s) (OPERAND128 src2 s)
+                                (OPERAND128 src3 s) (OPERAND8 imm8 s) masking s) s)) s
+    | VPTERNLOGD dest src2 src3 imm8 (SOME (Evex_deco masking Broadcast)) ->
+        (add_load_event dest s ,, add_load_event src2 s ,,
+         add_load_event src3 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VPTERNLOGD (OPERAND512 dest s) (OPERAND512 src2 s)
+                   (rvalue(word_duplicate(read (OPERAND32 src3 s) s):512 word))
+                   (OPERAND8 imm8 s) masking s
+        | 256 -> x86_VPTERNLOGD (OPERAND256 dest s) (OPERAND256 src2 s)
+                   (rvalue(word_duplicate(read (OPERAND32 src3 s) s):256 word))
+                   (OPERAND8 imm8 s) masking s
+        | 128 -> x86_VPTERNLOGD (OPERAND128 dest s) (OPERAND128 src2 s)
+                   (rvalue(word_duplicate(read (OPERAND32 src3 s) s):128 word))
+                   (OPERAND8 imm8 s) masking s) s)) s
     | VPXOR dest src1 src2 ->
         (add_load_event src1 s ,, add_load_event src2 s ,,
          add_store_event dest s ,,
@@ -4640,7 +4758,7 @@ let x86_MOVSB_ALT = prove
 (*** Simplify word operations in SIMD instructions ***)
 
 let all_simd_rules =
-   [usimd16;usimd8;usimd4;usimd2;simd16;simd8;simd4;simd2;msimd16;msimd8;msimd4;msimd2];;
+[usimd16;usimd8;usimd4;usimd2;simd32;simd16;simd8;simd4;simd2;msimd16;msimd8;msimd4;msimd2];;
 
 let EXPAND_SIMD_RULE =
   CONV_RULE (TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) o
@@ -4669,6 +4787,7 @@ let x86_VMOVDQA_ALT = EXPAND_SIMD_RULE x86_VMOVDQA;;
 let x86_VMOVDQU_ALT = EXPAND_SIMD_RULE x86_VMOVDQU;;
 let x86_VMOVSHDUP_ALT = EXPAND_SIMD_RULE x86_VMOVSHDUP;;
 let x86_VMOVSLDUP_ALT = EXPAND_SIMD_RULE x86_VMOVSLDUP;;
+let x86_VPADDB_ALT = EXPAND_SIMD_RULE x86_VPADDB;;
 let x86_VPADDD_ALT = EXPAND_SIMD_RULE x86_VPADDD;;
 let x86_VPADDQ_ALT = EXPAND_SIMD_RULE x86_VPADDQ;;
 let x86_VPADDW_ALT = EXPAND_SIMD_RULE x86_VPADDW;;
@@ -4754,7 +4873,7 @@ let X86_OPERATION_CLAUSES =
     x86_SAR; x86_SBB_ALT; x86_SET; x86_SHL; x86_SHLD; x86_SHR; x86_SHRD;
     x86_STC; x86_STD; x86_SUB_ALT; x86_TEST; x86_TZCNT; x86_XCHG; x86_XOR;
     (*** AVX2 instructions ***)
-    x86_VPADDD_ALT; x86_VPADDQ_ALT; x86_VPADDW_ALT; x86_VPMULHRSW_ALT; x86_VPMULHUW_ALT; x86_VPMULHW_ALT; x86_VPINSRD; x86_VPINSRQ; x86_VPINSRW; x86_VINSERTI128; x86_VEXTRACTI128;
+    x86_VPADDB_ALT; x86_VPADDD_ALT; x86_VPADDQ_ALT; x86_VPADDW_ALT; x86_VPMULHRSW_ALT; x86_VPMULHUW_ALT; x86_VPMULHW_ALT; x86_VPINSRD; x86_VPINSRQ; x86_VPINSRW; x86_VINSERTI128; x86_VEXTRACTI128;
     x86_VPCMPGTD_ALT; x86_VPCMPGTW_ALT;
     x86_VPEXTRD; x86_VPEXTRQ; x86_VPEXTRW; x86_VPMULLD_ALT; x86_VPMULLW_ALT; x86_VPSUBD_ALT; x86_VPSUBQ_ALT; x86_VPSUBW_ALT; x86_VPXOR;
     x86_VPAND; x86_VPANDN; x86_VPOR; x86_VPSRAD_ALT; x86_VPSRAW_ALT; x86_VPSRLD_ALT; x86_VPSRLDQ_ALT; x86_VPSRLVD_ALT; x86_VPSRLVQ_ALT; x86_VPSRLQ_ALT;

@@ -207,6 +207,15 @@ let read_ModRM = define
      SOME((rex_reg (rex_R rex) reg,
            RM_mem (%%(Gpr (rex_reg (rex_B rex) rm) Full_64,val disp))), l))`;;
 
+let read_EVEX_ModRM = new_definition
+ `read_EVEX_ModRM rex r' x l =
+  read_ModRM rex l >>= \((reg,rm),l).
+  let reg5 = word_join (word1 r') reg: 5 word in
+  let rm' = match rm with
+    | RM_reg r -> RM_reg (word_join (word1 x) (word_zx r:4 word): 5 word)
+    | RM_mem ea -> RM_mem ea in
+  SOME((reg5, rm'), l)`;;
+
 let gpr_adjust = new_definition `!sz reg. gpr_adjust (reg:4 word) sz =
   if sz = Upper_8 then
     if val reg < 4 then Gpr reg Lower_8
@@ -219,7 +228,7 @@ let operand_of_RM = define
   (!ea. operand_of_RM sz (RM_mem ea) = Memop (to_wordsize sz) ea)`;;
 
 let mmreg = new_definition
- `mmreg (reg:4 word) sz = %_%(Simdreg (word_zx reg) sz)`;;
+ `mmreg (reg:N word) sz = %_%(Simdreg (word_zx reg: 5 word) sz)`;;
 
 let simd_of_RM = define
  `(!reg. simd_of_RM sz (RM_reg reg) =
@@ -247,11 +256,23 @@ let read_opcode_ModRM_operand = new_definition
 let VEXM_INDUCTION,VEXM_RECURSION = define_type
  "VEXM = VEXM_0F | VEXM_0F38 | VEXM_0F3A";;
 
+let EVEXM_INDUCTION,EVEXM_RECURSION = define_type
+ "EVEXM = EVEXM_0F | EVEXM_0F38 | EVEXM_0F3A | EVEXM_MAP5 | EVEXM_MAP6";;
+
 let read_VEXM = new_definition `read_VEXM (m:5 word) =
   bitmatch m with
   | [1:5] -> SOME VEXM_0F
   | [2:5] -> SOME VEXM_0F38
   | [3:5] -> SOME VEXM_0F3A
+  | _ -> NONE`;;
+
+let read_EVEXM = new_definition `read_EVEXM (m:3 word) =
+  bitmatch m with
+  | [1:3] -> SOME EVEXM_0F
+  | [2:3] -> SOME EVEXM_0F38
+  | [3:3] -> SOME EVEXM_0F3A
+  | [5:3] -> SOME EVEXM_MAP5
+  | [6:3] -> SOME EVEXM_MAP6
   | _ -> NONE`;;
 
 let read_VEXP = new_definition `read_VEXP (p:2 word) =
@@ -272,9 +293,25 @@ let read_VEX = define
    read_VEXM m >>= \m.
    SOME((SOME(rex_reg w (word_not rxb)), m, word_not v, L, read_VEXP p), l))`;;
 
+let read_EVEX = define
+  `!l. read_EVEX l = 
+   read_byte l >>= \(b,l). bitmatch b with [rxb:3; r'; 0; m:3] ->
+   read_byte l >>= \(b,l). bitmatch b with [w; v:4; 1; p:2] ->
+   read_byte l >>= \(b,l). bitmatch b with [z:1; LL:2; bcast; V'; a:3] ->
+   read_EVEXM m >>= \m.
+   SOME((SOME(rex_reg w (word_not rxb)), ~r', m, (word_join (word1 V') (word_not v)), 
+         read_VEXP p, z, LL, bcast, a), l)`;;
+
 let vexL_size = define
  `vexL_size F = Lower_128 /\
   vexL_size T = Lower_256`;;
+
+let evexL_size = new_definition `evexL_size (LL:2 word) = 
+  bitmatch LL with
+  | [0:2] -> SOME Lower_128 
+  | [1:2] -> SOME Lower_256
+  | [2:2] -> SOME Full_512
+  | [3:2] -> NONE`;;
 
 let decode_condition = new_definition
  `decode_condition (n:4 word) =
@@ -589,6 +626,36 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
     SOME (PUSH (%(Gpr (rex_reg (rex_B rex) r) Full_64)),l)
   | [0b01011:5; r:3] -> if has_pfxs pfxs then NONE else
     SOME (POP (%(Gpr (rex_reg (rex_B rex) r) Full_64)),l)
+  (* EVEX prefix *)
+  | [0x62:8] -> if has_pfxs pfxs then NONE else
+    if is_some rex then NONE else
+    read_EVEX l >>= \((rex,r',m,v,pfxs,z,LL,bcast,a),l).
+    evexL_size LL >>= \sz.
+    let masking = if a = word 0 then Unmasked
+                  else if z = word 1 then Zero_mask a
+                  else Merge_mask a in
+    let brc = if bcast then Broadcast else No_brc in
+    let deco = SOME (Evex_deco masking brc) in
+    (match m with
+      EVEXM_0F3A ->
+        read_byte l >>= \(b,l).
+        (bitmatch b with
+        | [0x25:8] ->
+          read_EVEX_ModRM rex r' (rex_X rex) l >>= \((reg,rm),l).
+          read_imm Byte l >>= \(imm8,l).
+          (if bcast then match rm with
+              RM_mem ea ->
+                (match pfxs with
+                 | (T, Rep0, SG0) ->
+                   SOME (VPTERNLOGD (mmreg reg sz) (mmreg v sz) (Memop Doubleword ea) imm8 deco,l)
+                 | _ -> NONE)
+            | _ -> NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VPTERNLOGD (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) imm8 deco,l)
+             | _ -> NONE)
+        | _ -> NONE)
+    | _ -> NONE)
   | [0x63:8] -> if has_pfxs pfxs then NONE else
     let sz2 = op_size_W rex T pfxs in
     read_ModRM rex l >>= \((reg,rm),l).
@@ -1022,6 +1089,12 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
           (read_ModRM rex l >>= \((reg,rm),l).
            match pfxs with
            | (T, Rep0, SG0) -> SOME (VPSUBQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm),l)
+           | _ -> NONE)
+        | [0xfc:8] -> 
+          let sz = vexL_size L in
+          (read_ModRM rex l >>= \((reg,rm),l).
+           match pfxs with
+           | (T, Rep0, SG0) -> SOME (VPADDB (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm),l)
            | _ -> NONE)
         | [0xfd:8] ->
           let sz = vexL_size L in
