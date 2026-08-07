@@ -166,7 +166,7 @@ let read_displacement = new_definition `read_displacement (md:2 word) l =
   | _ -> NONE`;;
 
 let RM_INDUCTION,RM_RECURSION = define_type
- "RM = RM_reg (4 word) | RM_mem bsid";;
+ "RM = RM_reg (4 word) | RM_reg_evex (5 word) | RM_mem bsid";;
 
 let read_sib_displacement = new_definition
  `read_sib_displacement (md:2 word) (reg:4 word) l =
@@ -196,7 +196,7 @@ let read_ModRM = define
    bitmatch b:byte with
    | [0b00:2; reg:3; 0b101:3] ->
      read_int32 l >>= \(i,l).
-     SOME((rex_reg (rex_R rex) reg,RM_mem (Riprel (word_sx i))), l)
+     SOME((rex_reg (rex_R rex) reg, RM_mem (Riprel (word_sx i))), l)
    | [0b11:2; reg:3; rm:3] ->
      SOME((rex_reg (rex_R rex) reg, RM_reg (rex_reg (rex_B rex) rm)), l)
    | [md:2; reg:3; 0b100:3] ->
@@ -212,7 +212,7 @@ let read_EVEX_ModRM = new_definition
   read_ModRM rex l >>= \((reg,rm),l).
   let reg5 = word_join (word1 r') reg: 5 word in
   let rm' = match rm with
-    | RM_reg r -> RM_reg (word_join (word1 x) (word_zx r:4 word): 5 word)
+    | RM_reg r -> RM_reg_evex (word_join (word1 x) (word_zx r:4 word): 5 word)
     | RM_mem ea -> RM_mem ea in
   SOME((reg5, rm'), l)`;;
 
@@ -232,6 +232,8 @@ let mmreg = new_definition
 
 let simd_of_RM = define
  `(!reg. simd_of_RM sz (RM_reg reg) =
+         %_%(Simdreg (word_zx reg) sz)) /\
+  (!reg. simd_of_RM sz (RM_reg_evex reg) =
          %_%(Simdreg (word_zx reg) sz)) /\
   (!ea. simd_of_RM sz (RM_mem ea) = Memop (simd_to_wordsize sz) ea)`;;
 
@@ -294,13 +296,16 @@ let read_VEX = define
    SOME((SOME(rex_reg w (word_not rxb)), m, word_not v, L, read_VEXP p), l))`;;
 
 let read_EVEX = define
-  `!l. read_EVEX l = 
-   read_byte l >>= \(b,l). bitmatch b with [rxb:3; r'; 0; m:3] ->
-   read_byte l >>= \(b,l). bitmatch b with [w; v:4; 1; p:2] ->
-   read_byte l >>= \(b,l). bitmatch b with [z:1; LL:2; bcast; V'; a:3] ->
+  `!l. read_EVEX l =
+   read_byte l >>= \(b,l). (bitmatch b with [rxb:3; r'; 0:1; m:3] ->
+   read_byte l >>= \(b,l). (bitmatch b with [w; v:4; 1:1; p:2] ->
+   read_byte l >>= \(b,l). (bitmatch b with [z:1; LL:2; bcast; V'; a:3] ->
    read_EVEXM m >>= \m.
-   SOME((SOME(rex_reg w (word_not rxb)), ~r', m, (word_join (word1 V') (word_not v)), 
-         read_VEXP p, z, LL, bcast, a), l)`;;
+   SOME((SOME(rex_reg w (word_not rxb)), ~r', m, (word_join (word1 (~V')) (word_not v): 5 word),
+         read_VEXP p, z, LL, bcast, a), l)
+   | _ -> NONE)
+   | _ -> NONE)
+   | _ -> NONE)`;;
 
 let vexL_size = define
  `vexL_size F = Lower_128 /\
@@ -626,7 +631,6 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
     SOME (PUSH (%(Gpr (rex_reg (rex_B rex) r) Full_64)),l)
   | [0b01011:5; r:3] -> if has_pfxs pfxs then NONE else
     SOME (POP (%(Gpr (rex_reg (rex_B rex) r) Full_64)),l)
-  (* EVEX prefix *)
   | [0x62:8] -> if has_pfxs pfxs then NONE else
     if is_some rex then NONE else
     read_EVEX l >>= \((rex,r',m,v,pfxs,z,LL,bcast,a),l).
@@ -1776,6 +1780,29 @@ let VEXL_SIZE_CONV =
     with Failure _ -> failwith "VEXL_SIZE_CONV")
   | _ -> failwith "VEXL_SIZE_CONV";;
 
+let EVEXL_SIZE_CONV =
+  let pths = Array.init 4 (fun i ->
+    let n = mk_comb (`word:num->2 word`, mk_numeral (num i)) in
+    CONV_RULE (RAND_CONV BITMATCH_CONV) (SPEC n evexL_size)) in
+  function
+  | Comb(Const("evexL_size",_),Comb(Const("word",_),n)) ->
+    (try pths.(Num.int_of_num (dest_numeral n))
+    with Invalid_argument _ -> failwith "EVEXL_SIZE_CONV")
+  | _ -> failwith "EVEXL_SIZE_CONV";;
+
+let READ_EVEXM_CONV =
+  let pths = Array.init 8 (fun i -> try
+    let n = mk_comb (`word:num->3 word`, mk_numeral (num i)) in
+    Some (CONV_RULE (RAND_CONV BITMATCH_CONV) (SPEC n read_EVEXM))
+    with Failure _ -> None) in
+  function
+  | Comb(Const("read_EVEXM",_),Comb(Const("word",_),n)) ->
+    (match (try pths.(Num.int_of_num (dest_numeral n))
+            with Invalid_argument _ -> None) with
+     | Some th -> th
+     | None -> failwith "READ_EVEXM_CONV")
+  | _ -> failwith "READ_EVEXM_CONV";;
+
 let operand_of_RM = define
  `(!reg. operand_of_RM sz (RM_reg reg) = %(gpr_adjust reg sz)) /\
   (!ea. operand_of_RM sz (RM_mem ea) = Memop (to_wordsize sz) ea)`;;
@@ -1799,15 +1826,20 @@ let OPERAND_OF_RM_CONV =
   | _ -> failwith "OPERAND_OF_RM_CONV";;
 
 let SIMD_OF_RM_CONV =
-  let conv1 =
-    GEN_REWRITE_CONV I [CONJUNCT1 simd_of_RM] THENC
-    RAND_CONV(LAND_CONV WORD_ZX_CONV THENC SIMDREG_CONV)
+  let cs = CONJUNCTS simd_of_RM in
+  let reg_conv c =
+    GEN_REWRITE_CONV I [c] THENC
+    RAND_CONV(LAND_CONV WORD_ZX_CONV THENC SIMDREG_CONV) in
+  let conv1 = reg_conv (el 0 cs)         (* RM_reg *)
+  and conv1e = reg_conv (el 1 cs)        (* RM_reg_evex *)
   and conv2 =
-    GEN_REWRITE_CONV I [CONJUNCT2 simd_of_RM] THENC
+    GEN_REWRITE_CONV I [el 2 cs] THENC   (* RM_mem *)
     LAND_CONV SIMD_TO_WORDSIZE_CONV in
   fun tm -> match tm with
   | Comb(Comb(Const("simd_of_RM",_),sz'),Comb(Const("RM_reg",_),reg')) ->
     conv1 tm
+  | Comb(Comb(Const("simd_of_RM",_),sz'),Comb(Const("RM_reg_evex",_),reg')) ->
+    conv1e tm
   | Comb(Comb(Const("simd_of_RM",_),sz'),Comb(Const("RM_mem",_),ea')) ->
     conv2 tm
   | _ -> failwith "OPERAND_OF_RM_CONV";;
@@ -1969,6 +2001,10 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
     constructors_of seg_pfx_INDUCTION @
     constructors_of RM_INDUCTION @
     constructors_of VEXM_INDUCTION @
+    constructors_of EVEXM_INDUCTION @
+    constructors_of evex_masking_INDUCTION @
+    constructors_of evex_brc_INDUCTION @
+    constructors_of evex_deco_INDUCTION @
     constructors_of regsize_INDUCT @
     constructors_of simdregsize_INDUCT @
     constructors_of wordsize_INDUCT @
@@ -2008,6 +2044,14 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
     let th = SPEC_ALL read_opcode_ModRM in
     let Comb(Comb(_,rex),l) = lhs (concl th) in
     fun rex' l' -> INST [rex',rex; l',l] th
+  and pth_evex =
+    let th = SPEC_ALL read_EVEX in
+    let Comb(_,l) = lhs (concl th) in
+    fun l' -> INST [l',l] th
+  and pth_evex_modrm =
+    let th = SPEC_ALL read_EVEX_ModRM in
+    let Comb(Comb(Comb(Comb(_,rex),r'),x),l) = lhs (concl th) in
+    fun rex' r'' x' l' -> INST [rex',rex; r'',r'; x',x; l',l] th
   and rep_pfx_constructors = [`Rep0`; `RepZ`; `RepNZ`]
   and seg_pfx_constructors = [`SG0`; `CS`; `SS`; `DS`; `ES`]
   and VEXM_constructors = [`VEXM_0F`; `VEXM_0F38`; `VEXM_0F3A`] in
@@ -2317,6 +2361,33 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
           let g = try gs e2 with Failure _ -> failwith "match VEXM failed" in
           PROVE_HYP (REFL e2) (g ls)
         | _ -> failwith "match VEXM failed")
+    else if ty = `:RM` then
+      (* RM constructors carry arguments, so each pattern binds a fresh
+         variable that we unify against the actual value at apply time. *)
+      let pats = map (fun c ->
+          let aty = fst (dest_fun_ty (type_of c)) in
+          mk_comb (c, genvar aty))
+        [`RM_reg`; `RM_reg_evex`; `RM_mem`] in
+      let rec go = function
+        | [] -> []
+        | pat::ps ->
+          let ls = go ps in
+          let th1 = AP_THM (AP_TERM f (ASSUME (mk_eq (e, pat)))) cs in
+          let th = TRANS th1 (REPEATC MATCH_CONV (rhs (concl th1))) in
+          match rhs (concl th) with
+          | Const("NONE",_) -> ls
+          | r -> (try (repeat rator pat, (pat, evaluate r (F o TRANS th))) :: ls
+                  (* A constructor with no clause in this match leaves a stuck
+                     residual that evaluate rejects; such patterns are simply
+                     not reachable here, so skip them. *)
+                  with Failure _ | Invalid_argument _ -> ls) in
+      let gs = C assoc (go pats) in
+      fun ls ->
+        let e2 = rev_assoc e ls in
+        let pat, g =
+          try gs (repeat rator e2) with Failure _ -> failwith "match RM failed" in
+        let _,ls',_ = term_unify (frees pat) pat e2 in
+        PROVE_HYP (REFL e2) (g (ls' @ ls))
     else
       raise (Invalid_argument ("Unknown match type " ^ string_of_type ty))
   | Comb((Const("decode_BT",_) as f),a) -> eval_unary f a F DECODE_BT_CONV
@@ -2338,6 +2409,12 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
          a constant. *)
       (TRY_CONV WORD_SX_CONV)
   | Comb((Const("word_not",_) as f),a) -> eval_unary f a F WORD_NOT_CONV
+  | Comb((Const("~",_) as f),a) ->
+    eval_unary f a F (GEN_REWRITE_CONV I [NOT_CLAUSES])
+  | Comb((Const("word1",_) as f),a) ->
+    eval_unary f a F (REWRITE_CONV [word1; bitval])
+  | Comb(Comb((Const("word_join",_) as f),a),b) ->
+    eval_binary f a b F WORD_JOIN_CONV
   | Comb((Const("regsize8",_) as f),a) ->
     log_step "regsize8 [e]" evaluate a (fun th ->
       let th = AP_TERM f th in
@@ -2361,6 +2438,14 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
   | Comb(Const("read_VEXM",_),_) -> eval_opt t F READ_VEXM_CONV
   | Comb((Const("read_VEXP",_) as f),a) -> eval_unary f a F READ_VEXP_CONV
   | Comb(Comb(Const("read_VEX",_),_),_) -> eval_opt t F READ_VEX_CONV
+  | Comb(Const("read_EVEXM",_),_) -> eval_opt t F READ_EVEXM_CONV
+  | Comb(Const("evexL_size",_),_) -> eval_opt t F EVEXL_SIZE_CONV
+  | Comb(Const("read_EVEX",_),l) ->
+    let th = pth_evex l in
+    evaluate (rhs (concl th)) (F o TRANS th)
+  | Comb(Comb(Comb(Comb(Const("read_EVEX_ModRM",_),rex),r'),x),l) ->
+    let th = pth_evex_modrm rex r' x l in
+    evaluate (rhs (concl th)) (F o TRANS th)
   | Comb(Comb(Comb(Comb((Comb(Comb(Const("decode_hi",_),_),_)
       as f),sz),opc),rm),l) ->
     log_step "decode_hi .. .. [ ] .. .. .." evaluate sz (fun th ->
@@ -2381,10 +2466,18 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
   | Comb(Comb(Const("read_displacement",_),_),_) -> eval_opt t F READ_DISP_CONV
   | Comb(Comb((Const("rex_reg",_) as f),a),b) ->
     eval_binary f a b F REX_REG_CONV
-  | Comb((Const("rex_B",_) as f),a) -> eval_unary f a F REX_BIT_CONV
-  | Comb((Const("rex_X",_) as f),a) -> eval_unary f a F REX_BIT_CONV
-  | Comb((Const("rex_R",_) as f),a) -> eval_unary f a F REX_BIT_CONV
-  | Comb((Const("rex_W",_) as f),a) -> eval_unary f a F REX_BIT_CONV
+  | Comb((Const(("rex_B"|"rex_X"|"rex_R"|"rex_W"),_) as f),a) ->
+    (* REX_BIT_CONV only reduces a concrete rex (NONE or SOME(word n)).
+       In the EVEX path the rex is built as SOME(<deferred>), so defer
+       the reduction until the argument is instantiated. *)
+    log_step "rex_bit [e]" evaluate a (fun th ->
+      let th = AP_TERM f th in
+      let tm = rhs (concl th) in
+      let concrete = match rand tm with
+        | Const("NONE",_) -> true
+        | Comb(Const("SOME",_),Comb(Const("word",_),n)) -> is_numeral n
+        | _ -> false in
+      delay_if (not concrete) tm (F o TRANS th) REX_BIT_CONV)
   | Comb(Comb((Const("gpr_adjust",_) as f),a),b) ->
     eval_binary f a b F GPR_ADJUST_CONV
   | Comb(Comb((Const("Gpr",_) as f),a),b) -> eval_binary f a b F GPR_CONV
@@ -2805,10 +2898,15 @@ let add_ll_tac,LL_TAC =
         let e = lhand (body (rand g)) in
         match type_of e with
         | Tyapp("RM",[]) ->
+          (* RM_INDUCTION yields one conjunct per constructor (RM_reg,
+             RM_reg_evex, RM_mem); simplify the match in every conjunct. *)
+          let armconv = (BINDER_CONV o RAND_CONV o BINDER_CONV) MATCH_CONV' in
+          let rec conj_conv tm =
+            if is_conj tm then BINOP2_CONV armconv conj_conv tm
+            else armconv tm in
           SPEC_TAC (e, mk_var("x", type_of e)) THEN
           MATCH_MP_TAC RM_INDUCTION THEN
-          CONV_TAC (BINOP2_CONV ((BINDER_CONV o RAND_CONV o BINDER_CONV) MATCH_CONV')
-                                ((BINDER_CONV o RAND_CONV o BINDER_CONV) MATCH_CONV'))
+          CONV_TAC conj_conv
         | _ -> CONV_TAC ((RAND_CONV o BINDER_CONV) MATCH_CONV'));
      `a >>= b`, MATCH_MP_TAC list_linear_obind1]
     empty_net) in
@@ -2931,6 +3029,16 @@ let list_linear_decode_hi = (add_ll_opt o prove)
  (`!x v sz opc rm. list_linear_f (decode_hi x v sz opc rm)`,
   REPEAT GEN_TAC THEN GEN_REWRITE_TAC RAND_CONV [GSYM ETA_AX] THEN
   REWRITE_TAC [decode_hi] THEN REPEAT LL_TAC);;
+
+let list_linear_read_EVEX = (add_ll_opt o prove)
+ (`list_linear_f read_EVEX`,
+  GEN_REWRITE_TAC RAND_CONV [GSYM ETA_AX] THEN
+  REWRITE_TAC [read_EVEX] THEN REPEAT LL_TAC);;
+
+let list_linear_read_EVEX_ModRM = (add_ll_opt o prove)
+ (`!rex r' x. list_linear_f (read_EVEX_ModRM rex r' x)`,
+  UNETA_TAC `read_EVEX_ModRM rex r' x l` THEN
+  REWRITE_TAC [read_EVEX_ModRM] THEN REPEAT LL_TAC);;
 
 let list_linear_decode_aux = prove
  (`!pfxs rex h. list_linear_f (\l. decode_aux pfxs rex (CONS h l))`,
