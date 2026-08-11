@@ -4420,6 +4420,40 @@ let OPERAND_CLAUSES = prove
    OPERAND256(%_% ymm15) s = YMM15  /\
    OPERAND256 (Memop Word256 bsid) s =
     memory :> bytes256 (bsid_semantics bsid s) /\
+   OPERAND512(%_% zmm0) s = ZMM0  /\
+   OPERAND512(%_% zmm1) s = ZMM1  /\
+   OPERAND512(%_% zmm2) s = ZMM2  /\
+   OPERAND512(%_% zmm3) s = ZMM3  /\
+   OPERAND512(%_% zmm4) s = ZMM4  /\
+   OPERAND512(%_% zmm5) s = ZMM5  /\
+   OPERAND512(%_% zmm6) s = ZMM6  /\
+   OPERAND512(%_% zmm7) s = ZMM7  /\
+   OPERAND512(%_% zmm8) s = ZMM8  /\
+   OPERAND512(%_% zmm9) s = ZMM9  /\
+   OPERAND512(%_% zmm10) s = ZMM10  /\
+   OPERAND512(%_% zmm11) s = ZMM11  /\
+   OPERAND512(%_% zmm12) s = ZMM12  /\
+   OPERAND512(%_% zmm13) s = ZMM13  /\
+   OPERAND512(%_% zmm14) s = ZMM14  /\
+   OPERAND512(%_% zmm15) s = ZMM15  /\
+   OPERAND512(%_% zmm16) s = ZMM16  /\
+   OPERAND512(%_% zmm17) s = ZMM17  /\
+   OPERAND512(%_% zmm18) s = ZMM18  /\
+   OPERAND512(%_% zmm19) s = ZMM19  /\
+   OPERAND512(%_% zmm20) s = ZMM20  /\
+   OPERAND512(%_% zmm21) s = ZMM21  /\
+   OPERAND512(%_% zmm22) s = ZMM22  /\
+   OPERAND512(%_% zmm23) s = ZMM23  /\
+   OPERAND512(%_% zmm24) s = ZMM24  /\
+   OPERAND512(%_% zmm25) s = ZMM25  /\
+   OPERAND512(%_% zmm26) s = ZMM26  /\
+   OPERAND512(%_% zmm27) s = ZMM27  /\
+   OPERAND512(%_% zmm28) s = ZMM28  /\
+   OPERAND512(%_% zmm29) s = ZMM29  /\
+   OPERAND512(%_% zmm30) s = ZMM30  /\
+   OPERAND512(%_% zmm31) s = ZMM31  /\
+   OPERAND512 (Memop Word512 bsid) s =
+    memory :> bytes512 (bsid_semantics bsid s) /\
    OPERAND64 (%rax) s = RAX /\
    OPERAND64 (%rcx) s = RCX /\
    OPERAND64 (%rdx) s = RDX /\
@@ -4527,11 +4561,13 @@ let OPERAND_CLAUSES = prove
               YMM8_SSE; YMM9_SSE; YMM10_SSE; YMM11_SSE;
               YMM12_SSE; YMM13_SSE; YMM14_SSE; YMM15_SSE;
               ZMM0; ZMM1; ZMM2; ZMM3; ZMM4; ZMM5; ZMM6; ZMM7; ZMM8;
-              ZMM9; ZMM10; ZMM11; ZMM12; ZMM13; ZMM14; ZMM15] THEN
+              ZMM9; ZMM10; ZMM11; ZMM12; ZMM13; ZMM14; ZMM15;
+              ZMM16; ZMM17; ZMM18; ZMM19; ZMM20; ZMM21; ZMM22; ZMM23;
+              ZMM24; ZMM25; ZMM26; ZMM27; ZMM28; ZMM29; ZMM30; ZMM31] THEN
   REWRITE_TAC[simple_immediate; base_displacement; QWORD] THEN
-  REWRITE_TAC[OPERAND256; OPERAND128; OPERAND128_SSE; OPERAND64; OPERAND32; OPERAND16; OPERAND8;
+  REWRITE_TAC[OPERAND512; OPERAND256; OPERAND128; OPERAND128_SSE; OPERAND64; OPERAND32; OPERAND16; OPERAND8;
               register_size; regsize; simdregister_size; simdregsize;
-              SIMD256; SIMD128; SIMD128_SSE; GPR64; GPR32_Z; GPR32; GPR16; GPR8] THEN
+              SIMD512; SIMD256; SIMD128; SIMD128_SSE; GPR64; GPR32_Z; GPR32; GPR16; GPR8] THEN
   REWRITE_TAC[COMPONENT_COMPOSE_ASSOC]);;
 
 (* ------------------------------------------------------------------------- *)
