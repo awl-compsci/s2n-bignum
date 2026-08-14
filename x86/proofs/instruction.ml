@@ -249,7 +249,7 @@ let evex_masking_INDUCTION,evex_masking_RECURSION = define_type
   | Merge_mask (3 word)
   | Zero_mask (3 word)";;
 
-(* Rounding and SAE only concern floating-point arithmetic and are currently dropped. *)
+(* Rounding and SAE only concern floating-point arithmetic and are currently not considered. *)
 let evex_brc_INDUCTION,evex_brc_RECURSION = define_type
  "evex_brc =
     No_brc
@@ -419,7 +419,7 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | VPSUBQ operand operand operand
    | VPSUBW operand operand operand
    | VPTEST operand operand
-   | VPTERNLOGD operand operand operand operand (evex_deco option)
+   | VPTERNLOGD operand operand operand operand evex_deco
    | VPUNPCKHQDQ operand operand operand
    | VPUNPCKLQDQ operand operand operand
    | VPXOR operand operand operand

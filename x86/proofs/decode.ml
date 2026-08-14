@@ -173,14 +173,53 @@ let read_displacement = new_definition `read_displacement (md:2 word) l =
    scaled. See Intel SDM Vol.2 2.6.5 "Compressed Displacement (disp8*N)" and
    Table 2-34/2-35.
 
-   For "Full"-tuple integer instructions like VPTERNLOGD, N is the memory-access
-   size in bytes: with a broadcast it is the broadcast element size (4 bytes for
-   a dword broadcast), otherwise it is the full vector size in bytes
-   (16/32/64 for 128/256/512-bit). *)
-let evex_disp_scale = new_definition
- `evex_disp_scale bcast sz =
-    if bcast then 4
-    else match sz with Lower_128 -> 16 | Lower_256 -> 32 | Full_512 -> 64`;;
+   N is classified by SDM tuple type. `evex_tuple` enumerates the tuple types and
+   `evex_tuple_disp_scale tup w bcast sz` is the complete factor table (Tables
+   2-34/2-35): N as a function of the tuple type, the EVEX.W bit `w`, the
+   broadcast bit `bcast` and the vector length `sz`. The 0x62 decode dispatch
+   derives N by calling this table directly: VPTERNLOGD is a Full-tuple dword
+   instruction, so it passes `evex_tuple_disp_scale Full_Tuple F bcast sz` (= 4
+   for a dword broadcast, else the full vector size 16/32/64), which the scaled
+   ModRM reader multiplies into the disp8 to form the effective displacement.
+   Adding a non-Full EVEX instruction means its dispatch arm passes the
+   appropriate `evex_tuple` constructor here; any resulting N outside the
+   currently precomputed {4,16,32,64} also needs a matching READ_*_SCALED table
+   entry in the DECODE_CONV setup. *)
+let evex_tuple_INDUCT,evex_tuple_RECURSION = define_type
+ "evex_tuple =
+    Full_Tuple | Half_Tuple
+  | Tuple1_Scalar_Byte | Tuple1_Scalar_Word | Tuple1_Scalar | Tuple1_Fixed
+  | Tuple2 | Tuple4 | Tuple8
+  | Full_Mem | Mem_128 | MovDDup | Half_Mem | Quarter_Mem | Eighth_Mem";;
+
+(* Complete SDM disp8*N tuple-factor table (Vol.2 Tables 2-34/2-35). Broadcast
+   rows use the element size (4 dword / 8 qword, by W); memory rows use fractions
+   of the vector length L in bytes (16/32/64 for 128/256/512-bit). *)
+let evex_tuple_disp_scale = define
+ `(evex_tuple_disp_scale Full_Tuple w bcast sz =
+     if bcast then (if w then 8 else 4)
+     else (match sz with Lower_128 -> 16 | Lower_256 -> 32 | Full_512 -> 64)) /\
+  (evex_tuple_disp_scale Half_Tuple w bcast sz =
+     if bcast then 4
+     else (match sz with Lower_128 -> 8 | Lower_256 -> 16 | Full_512 -> 32)) /\
+  (evex_tuple_disp_scale Tuple1_Scalar_Byte w bcast sz = 1) /\
+  (evex_tuple_disp_scale Tuple1_Scalar_Word w bcast sz = 2) /\
+  (evex_tuple_disp_scale Tuple1_Scalar w bcast sz = if w then 8 else 4) /\
+  (evex_tuple_disp_scale Tuple1_Fixed w bcast sz = if w then 8 else 4) /\
+  (evex_tuple_disp_scale Tuple2 w bcast sz = if w then 16 else 8) /\
+  (evex_tuple_disp_scale Tuple4 w bcast sz = if w then 32 else 16) /\
+  (evex_tuple_disp_scale Tuple8 w bcast sz = 32) /\
+  (evex_tuple_disp_scale Full_Mem w bcast sz =
+     (match sz with Lower_128 -> 16 | Lower_256 -> 32 | Full_512 -> 64)) /\
+  (evex_tuple_disp_scale Mem_128 w bcast sz = 16) /\
+  (evex_tuple_disp_scale MovDDup w bcast sz =
+     (match sz with Lower_128 -> 8 | Lower_256 -> 32 | Full_512 -> 64)) /\
+  (evex_tuple_disp_scale Half_Mem w bcast sz =
+     (match sz with Lower_128 -> 8 | Lower_256 -> 16 | Full_512 -> 32)) /\
+  (evex_tuple_disp_scale Quarter_Mem w bcast sz =
+     (match sz with Lower_128 -> 4 | Lower_256 -> 8 | Full_512 -> 16)) /\
+  (evex_tuple_disp_scale Eighth_Mem w bcast sz =
+     (match sz with Lower_128 -> 2 | Lower_256 -> 4 | Full_512 -> 8))`;;
 
 (* Like read_displacement but scales the disp8 case by n (disp32/disp0 as-is). *)
 let read_displacement_scaled = new_definition
@@ -709,13 +748,13 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
                   else if z = word 1 then Zero_mask a
                   else Merge_mask a in
     let brc = if bcast then Broadcast else No_brc in
-    let deco = SOME (Evex_deco masking brc) in
+    let deco = Evex_deco masking brc in
     (match m with
       EVEXM_0F3A ->
         read_byte l >>= \(b,l).
         (bitmatch b with
         | [0x25:8] ->
-          read_EVEX_ModRM (evex_disp_scale bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple F bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
           read_imm Byte l >>= \(imm8,l).
           (if bcast then match rm with
               RM_mem ea ->
@@ -2252,17 +2291,17 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
   | _ -> failwith "READ_MODRM_CONV" in
 
   let EVEX_DISP_SCALE_CONV =
-    REWR_CONV evex_disp_scale THENC
+    REWRITE_CONV [evex_tuple_disp_scale] THENC
     REWRITE_CONV [COND_CLAUSES] THENC
     TOP_DEPTH_CONV MATCH_CONV in
 
   (* The tuple factor reaches the scaled CONVs either as a numeral or as an
-     unreduced `evex_disp_scale bcast sz` term (both args concrete); fold the
-     latter first. *)
+     unreduced `evex_tuple_disp_scale tup w bcast sz` term (all args concrete);
+     fold the latter first. *)
   let scale_num n =
     if is_numeral n then n else rhs (concl (EVEX_DISP_SCALE_CONV n)) in
   let scale_of n = Num.int_of_num (dest_numeral (scale_num n)) in
-  (* The scaled readers appear in the term with n = `evex_disp_scale bcast sz`
+  (* The scaled readers appear in the term with n = `evex_tuple_disp_scale ...`
      (unreduced) but the precomputed tables are keyed by the numeral. Fold n to
      the numeral, look up the table for the numeric-n form, then rebuild the
      result with the ORIGINAL n on the left (so the deferred-eval machinery can
@@ -2619,7 +2658,7 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
     evaluate (rhs (concl th)) (F o TRANS th)
   | Comb(Comb(Comb(Comb(Comb(Const("read_EVEX_ModRM",_),n),rex),r'),x),l) ->
     (* Unfold read_EVEX_ModRM with the tuple factor n as-is (it is a symbolic
-       `evex_disp_scale bcast sz` during the symbolic table build). The body's
+       `evex_tuple_disp_scale Full_Tuple F bcast sz` during the symbolic table build). The body's
        scaled readers defer via eval_opt; their conversions fold n to a numeral
        at apply time while keeping the term's LHS intact so it discharges. *)
     let th = pth_evex_modrm n rex r' x l in

@@ -2511,8 +2511,9 @@ let x86_VPXOR = new_definition
         let z = word_xor x y in
         (dest := (z:N word)) s`;;
 
-(* Get the mask encoded by the `a` field in the encoding. *)
-(* If `a` is 0, that means no masking applies; we return a word of all 1's.*)
+(* Get the per-lane mask encoded by the `a` field in the encoding. *)
+(* If `a` is 0, that means no masking applies; we return a word of all 1's,
+   meaning that all lanes should be active. *)
 (* Otherwise, we read the `a`-th mask register and use that as our mask. *)
 let evex_mask = new_definition
  `evex_mask (k:3 word) (s:x86state) : 64 word =
@@ -2527,7 +2528,7 @@ let dword_expand_mask = new_definition
 
 (* This function applies the EVEX mask. *)
 (* Merge mask is such that if the mask bit is 1, we use the corresponding new result bit;
-    otherwise, we use the old bit before the operaion. *)
+    otherwise, we use the old bit before the operation. *)
 (* Zero mask is such that if the mask bit is 1, we use the corresponding new result bit;
     otherwise, we use 0. *)
 let apply_evex_masking_dword = new_definition
@@ -2733,6 +2734,19 @@ let aligned_OPERAND128 = define
 let aligned_OPERAND256 = define
  `(aligned_OPERAND256 (Simdregister r) s <=> T) /\
   (aligned_OPERAND256 (Memop w ea) s <=> aligned 32 (bsid_semantics ea s))`;;
+
+(* Read an EVEX SIMD source operand honoring the broadcast decoration:
+   No_brc     -> the full-width operand component `full` (as already selected by
+                 OPERANDn at the call site);
+   Broadcast  -> read one dword from `src` and duplicate it to the operand width.
+   Returning a component (not a value) keeps the No_brc form identical to a plain
+   OPERANDn read. This is instruction-generic: any broadcast-capable EVEX op can
+   use it, instead of duplicating the logic in each instruction's dispatch or in
+   the per-instruction semantics. *)
+let simd_src3 = define
+ `(simd_src3 No_brc (full:(x86state,N word)component) (src:operand) s = full) /\
+  (simd_src3 Broadcast (full:(x86state,N word)component) (src:operand) s =
+     rvalue (word_duplicate (read (OPERAND32 src s) s) :N word))`;;
 
 (* ------------------------------------------------------------------------- *)
 (* Stating assumptions about instruction decoding                            *)
@@ -3897,39 +3911,16 @@ let x86_execute = define
                             (OPERAND8 imm8 s)
         | 128 -> x86_VPSRLW (OPERAND128 dest s) (OPERAND128 src s)
                             (OPERAND8 imm8 s)) s)) s
-    | VPTERNLOGD dest src2 src3 imm8 NONE ->
+    | VPTERNLOGD dest src2 src3 imm8 (Evex_deco masking brc) ->
         (add_load_event dest s ,, add_load_event src2 s ,,
          add_load_event src3 s ,, add_store_event dest s ,,
         (\s. (match operand_size dest with
           512 -> x86_VPTERNLOGD (OPERAND512 dest s) (OPERAND512 src2 s)
-                                (OPERAND512 src3 s) (OPERAND8 imm8 s) Unmasked
+                   (simd_src3 brc (OPERAND512 src3 s) src3 s) (OPERAND8 imm8 s) masking
         | 256 -> x86_VPTERNLOGD (OPERAND256 dest s) (OPERAND256 src2 s)
-                                (OPERAND256 src3 s) (OPERAND8 imm8 s) Unmasked
+                   (simd_src3 brc (OPERAND256 src3 s) src3 s) (OPERAND8 imm8 s) masking
         | 128 -> x86_VPTERNLOGD (OPERAND128 dest s) (OPERAND128 src2 s)
-                                (OPERAND128 src3 s) (OPERAND8 imm8 s) Unmasked) s)) s
-    | VPTERNLOGD dest src2 src3 imm8 (SOME (Evex_deco masking No_brc)) ->
-        (add_load_event dest s ,, add_load_event src2 s ,,
-         add_load_event src3 s ,, add_store_event dest s ,,
-        (\s. (match operand_size dest with
-          512 -> x86_VPTERNLOGD (OPERAND512 dest s) (OPERAND512 src2 s)
-                                (OPERAND512 src3 s) (OPERAND8 imm8 s) masking
-        | 256 -> x86_VPTERNLOGD (OPERAND256 dest s) (OPERAND256 src2 s)
-                                (OPERAND256 src3 s) (OPERAND8 imm8 s) masking
-        | 128 -> x86_VPTERNLOGD (OPERAND128 dest s) (OPERAND128 src2 s)
-                                (OPERAND128 src3 s) (OPERAND8 imm8 s) masking) s)) s
-    | VPTERNLOGD dest src2 src3 imm8 (SOME (Evex_deco masking Broadcast)) ->
-        (add_load_event dest s ,, add_load_event src2 s ,,
-         add_load_event src3 s ,, add_store_event dest s ,,
-        (\s. (match operand_size dest with
-          512 -> x86_VPTERNLOGD (OPERAND512 dest s) (OPERAND512 src2 s)
-                   (rvalue(word_duplicate(read (OPERAND32 src3 s) s):512 word))
-                   (OPERAND8 imm8 s) masking
-        | 256 -> x86_VPTERNLOGD (OPERAND256 dest s) (OPERAND256 src2 s)
-                   (rvalue(word_duplicate(read (OPERAND32 src3 s) s):256 word))
-                   (OPERAND8 imm8 s) masking
-        | 128 -> x86_VPTERNLOGD (OPERAND128 dest s) (OPERAND128 src2 s)
-                   (rvalue(word_duplicate(read (OPERAND32 src3 s) s):128 word))
-                   (OPERAND8 imm8 s) masking) s)) s
+                   (simd_src3 brc (OPERAND128 src3 s) src3 s) (OPERAND8 imm8 s) masking) s)) s
     | VPXOR dest src1 src2 ->
         (add_load_event src1 s ,, add_load_event src2 s ,,
          add_store_event dest s ,,
@@ -5118,7 +5109,9 @@ let X86_CONV (decode_ths:thm option array) ths tm =
    ONCE_DEPTH_CONV OPERAND_SIZE_CONV THENC
    REWRITE_CONV[condition_semantics; aligned_OPERAND128; aligned_OPERAND256] THENC
    REWRITE_CONV[OPERAND_SIZE_CASES] THENC
-   REWRITE_CONV[OPERAND_CLAUSES] THENC
+   (* simd_src3 must unfold together with OPERAND_CLAUSES: its broadcast clause
+      surfaces a fresh `OPERAND32 src s` that OPERAND_CLAUSES then reduces. *)
+   REWRITE_CONV[simd_src3; OPERAND_CLAUSES] THENC
    ONCE_DEPTH_CONV BSID_SEMANTICS_CONV THENC
    REWRITE_CONV X86_OPERATION_CLAUSES THENC
    REWRITE_CONV[READ_RVALUE;
