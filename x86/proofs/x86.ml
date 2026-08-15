@@ -340,6 +340,57 @@ add_component_alias_thms
  [XMM0; XMM1; XMM2; XMM3; XMM4; XMM5; XMM6; XMM7;
   XMM8; XMM9; XMM10; XMM11; XMM12; XMM13; XMM14; XMM15];;
 
+(* ------------------------------------------------------------------------- *)
+(* Opt-in "re-sugar" for AVX2 proofs.                                         *)
+(*                                                                            *)
+(* The 512-bit ZMM-rooted model (correct for AVX-512) makes a VEX register    *)
+(* read come out of stepping as `word_zx (read ZMMn s)` (via READ_ZEROTOP_256)*)
+(* rather than the `read YMMn s` alias the pre-existing AVX2 proofs' hand-     *)
+(* written lemmas match against. These two forms are definitionally equal.    *)
+(*                                                                            *)
+(* This canNOT be normalised inside the shared stepping tactic: doing so      *)
+(* collides with cross-step read resolution (keyed on `read ZMMn`) and with   *)
+(* the co-simulation's ZMM preconditions. Instead we expose an OPT-IN tactic  *)
+(* that an individual AVX2 proof may run *after* stepping and *before* its own *)
+(* YMM-shaped rewrites, to re-sugar the leftover reads. It is used by no other *)
+(* proof and by no co-simulation, so it cannot regress them.                  *)
+(* ------------------------------------------------------------------------- *)
+
+let VEX_READ_ZMM_FOLD:thm list = map (fun (goal,ymmdef) ->
+  prove(goal, REWRITE_TAC[ymmdef; READ_ZEROTOP_256]))
+ [(`!s:x86state. word_zx (read ZMM0 s):256 word = read YMM0 s`,YMM0);
+  (`!s:x86state. word_zx (read ZMM1 s):256 word = read YMM1 s`,YMM1);
+  (`!s:x86state. word_zx (read ZMM2 s):256 word = read YMM2 s`,YMM2);
+  (`!s:x86state. word_zx (read ZMM3 s):256 word = read YMM3 s`,YMM3);
+  (`!s:x86state. word_zx (read ZMM4 s):256 word = read YMM4 s`,YMM4);
+  (`!s:x86state. word_zx (read ZMM5 s):256 word = read YMM5 s`,YMM5);
+  (`!s:x86state. word_zx (read ZMM6 s):256 word = read YMM6 s`,YMM6);
+  (`!s:x86state. word_zx (read ZMM7 s):256 word = read YMM7 s`,YMM7);
+  (`!s:x86state. word_zx (read ZMM8 s):256 word = read YMM8 s`,YMM8);
+  (`!s:x86state. word_zx (read ZMM9 s):256 word = read YMM9 s`,YMM9);
+  (`!s:x86state. word_zx (read ZMM10 s):256 word = read YMM10 s`,YMM10);
+  (`!s:x86state. word_zx (read ZMM11 s):256 word = read YMM11 s`,YMM11);
+  (`!s:x86state. word_zx (read ZMM12 s):256 word = read YMM12 s`,YMM12);
+  (`!s:x86state. word_zx (read ZMM13 s):256 word = read YMM13 s`,YMM13);
+  (`!s:x86state. word_zx (read ZMM14 s):256 word = read YMM14 s`,YMM14);
+  (`!s:x86state. word_zx (read ZMM15 s):256 word = read YMM15 s`,YMM15)];;
+
+let X86_YMM_RESUGAR_TAC:tactic =
+  RULE_ASSUM_TAC(PURE_REWRITE_RULE VEX_READ_ZMM_FOLD) THEN
+  PURE_REWRITE_TAC VEX_READ_ZMM_FOLD THEN
+  (* Collapse the word_zx round-trips the ZMM rooting introduces at the vector
+     width boundaries: a VEX op writes `word_zx(result):512` into ZMM (zerotop)
+     and a later read takes `word_zx(...):256/128` back out, i.e. an M -> 512 -> M
+     round-trip that WORD_ZX_ZX cancels (M <= 512). The proofs' own collapse step
+     only supplies the 32/64 sizes, so the 128/256/512 layers are left; add them. *)
+  SIMP_TAC[WORD_ZX_ZX; DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+           DIMINDEX_32; DIMINDEX_64;
+           ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+           ARITH_RULE `256 <= 512`; ARITH_RULE `32 <= 64`;
+           ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
+           ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`;
+           ARITH_RULE `64 <= 256`; ARITH_RULE `64 <= 512`];;
+
 (*** Note that K0 is actually hardwired to all-1s              ***)
 (*** So strictly we should have left it out of the state above ***)
 
@@ -1019,24 +1070,31 @@ let x86_DEC = new_definition
 let x86_ENDBR64 = new_definition
  `x86_ENDBR64 (s:x86state) = \s'. s = s'`;;
 
+(* VZEROUPPER zeroes bits [MAXVL-1:128] of the first 16 vector registers,
+   preserving the low 128 bits. On AVX-512 hardware MAXVL = 512, so this zeroes
+   [511:128] of ZMM0-15. Rooted directly at ZMM (word_zx of the low 128 bits up
+   to int512 zeroes [511:128]) so the write lands on the full register and
+   collapses in the ZMM-based stepping framework -- semantically identical to the
+   older YMM-alias formulation (writing YMM = ZMM:>zerotop_256 also zeroed the
+   [511:256] tail), but reducible now that the cosimulation regfile reads ZMM. *)
 let x86_VZEROUPPER = new_definition
  `x86_VZEROUPPER (s:x86state) =
-  (YMM0  := word_zx(word_subword (read YMM0  s) (0,128):int128) ,,
-   YMM1  := word_zx(word_subword (read YMM1  s) (0,128):int128) ,,
-   YMM2  := word_zx(word_subword (read YMM2  s) (0,128):int128) ,,
-   YMM3  := word_zx(word_subword (read YMM3  s) (0,128):int128) ,,
-   YMM4  := word_zx(word_subword (read YMM4  s) (0,128):int128) ,,
-   YMM5  := word_zx(word_subword (read YMM5  s) (0,128):int128) ,,
-   YMM6  := word_zx(word_subword (read YMM6  s) (0,128):int128) ,,
-   YMM7  := word_zx(word_subword (read YMM7  s) (0,128):int128) ,,
-   YMM8  := word_zx(word_subword (read YMM8  s) (0,128):int128) ,,
-   YMM9  := word_zx(word_subword (read YMM9  s) (0,128):int128) ,,
-   YMM10 := word_zx(word_subword (read YMM10 s) (0,128):int128) ,,
-   YMM11 := word_zx(word_subword (read YMM11 s) (0,128):int128) ,,
-   YMM12 := word_zx(word_subword (read YMM12 s) (0,128):int128) ,,
-   YMM13 := word_zx(word_subword (read YMM13 s) (0,128):int128) ,,
-   YMM14 := word_zx(word_subword (read YMM14 s) (0,128):int128) ,,
-   YMM15 := word_zx(word_subword (read YMM15 s) (0,128):int128)) s`;;
+  (ZMM0  := (word_zx(word_subword (read ZMM0  s) (0,128):int128):(512)word) ,,
+   ZMM1  := (word_zx(word_subword (read ZMM1  s) (0,128):int128):(512)word) ,,
+   ZMM2  := (word_zx(word_subword (read ZMM2  s) (0,128):int128):(512)word) ,,
+   ZMM3  := (word_zx(word_subword (read ZMM3  s) (0,128):int128):(512)word) ,,
+   ZMM4  := (word_zx(word_subword (read ZMM4  s) (0,128):int128):(512)word) ,,
+   ZMM5  := (word_zx(word_subword (read ZMM5  s) (0,128):int128):(512)word) ,,
+   ZMM6  := (word_zx(word_subword (read ZMM6  s) (0,128):int128):(512)word) ,,
+   ZMM7  := (word_zx(word_subword (read ZMM7  s) (0,128):int128):(512)word) ,,
+   ZMM8  := (word_zx(word_subword (read ZMM8  s) (0,128):int128):(512)word) ,,
+   ZMM9  := (word_zx(word_subword (read ZMM9  s) (0,128):int128):(512)word) ,,
+   ZMM10 := (word_zx(word_subword (read ZMM10 s) (0,128):int128):(512)word) ,,
+   ZMM11 := (word_zx(word_subword (read ZMM11 s) (0,128):int128):(512)word) ,,
+   ZMM12 := (word_zx(word_subword (read ZMM12 s) (0,128):int128):(512)word) ,,
+   ZMM13 := (word_zx(word_subword (read ZMM13 s) (0,128):int128):(512)word) ,,
+   ZMM14 := (word_zx(word_subword (read ZMM14 s) (0,128):int128):(512)word) ,,
+   ZMM15 := (word_zx(word_subword (read ZMM15 s) (0,128):int128):(512)word)) s`;;
 
 (*** There are really four different multiplies here.
  ***
@@ -4357,58 +4415,58 @@ let BSID_CLAUSES = prove
   REWRITE_TAC[BSID_CLAUSES_GEN; base_displacement]);;
 
 let OPERAND_CLAUSES = prove
- (`OPERAND128(%_% xmm0) s = YMM0 :> zerotop_128  /\
-   OPERAND128(%_% xmm1) s = YMM1 :> zerotop_128  /\
-   OPERAND128(%_% xmm2) s = YMM2 :> zerotop_128  /\
-   OPERAND128(%_% xmm3) s = YMM3 :> zerotop_128  /\
-   OPERAND128(%_% xmm4) s = YMM4 :> zerotop_128  /\
-   OPERAND128(%_% xmm5) s = YMM5 :> zerotop_128  /\
-   OPERAND128(%_% xmm6) s = YMM6 :> zerotop_128  /\
-   OPERAND128(%_% xmm7) s = YMM7 :> zerotop_128  /\
-   OPERAND128(%_% xmm8) s = YMM8 :> zerotop_128  /\
-   OPERAND128(%_% xmm9) s = YMM9 :> zerotop_128  /\
-   OPERAND128(%_% xmm10) s = YMM10 :> zerotop_128  /\
-   OPERAND128(%_% xmm11) s = YMM11 :> zerotop_128  /\
-   OPERAND128(%_% xmm12) s = YMM12 :> zerotop_128  /\
-   OPERAND128(%_% xmm13) s = YMM13 :> zerotop_128  /\
-   OPERAND128(%_% xmm14) s = YMM14 :> zerotop_128  /\
-   OPERAND128(%_% xmm15) s = YMM15 :> zerotop_128  /\
+ (`OPERAND128(%_% xmm0) s = (ZMM0 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm1) s = (ZMM1 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm2) s = (ZMM2 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm3) s = (ZMM3 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm4) s = (ZMM4 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm5) s = (ZMM5 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm6) s = (ZMM6 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm7) s = (ZMM7 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm8) s = (ZMM8 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm9) s = (ZMM9 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm10) s = (ZMM10 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm11) s = (ZMM11 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm12) s = (ZMM12 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm13) s = (ZMM13 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm14) s = (ZMM14 :> zerotop_256) :> zerotop_128  /\
+   OPERAND128(%_% xmm15) s = (ZMM15 :> zerotop_256) :> zerotop_128  /\
    OPERAND128 (Memop Word128 bsid) s =
     memory :> bytes128 (bsid_semantics bsid s) /\
-   OPERAND128_SSE(%_% xmm0) s = YMM0_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm1) s = YMM1_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm2) s = YMM2_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm3) s = YMM3_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm4) s = YMM4_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm5) s = YMM5_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm6) s = YMM6_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm7) s = YMM7_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm8) s = YMM8_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm9) s = YMM9_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm10) s = YMM10_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm11) s = YMM11_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm12) s = YMM12_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm13) s = YMM13_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm14) s = YMM14_SSE :> bottom_128  /\
-   OPERAND128_SSE(%_% xmm15) s = YMM15_SSE :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm0) s = (ZMM0 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm1) s = (ZMM1 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm2) s = (ZMM2 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm3) s = (ZMM3 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm4) s = (ZMM4 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm5) s = (ZMM5 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm6) s = (ZMM6 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm7) s = (ZMM7 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm8) s = (ZMM8 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm9) s = (ZMM9 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm10) s = (ZMM10 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm11) s = (ZMM11 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm12) s = (ZMM12 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm13) s = (ZMM13 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm14) s = (ZMM14 :> bottom_256) :> bottom_128  /\
+   OPERAND128_SSE(%_% xmm15) s = (ZMM15 :> bottom_256) :> bottom_128  /\
    OPERAND128_SSE (Memop Word128 bsid) s =
     memory :> bytes128 (bsid_semantics bsid s) /\
-   OPERAND256(%_% ymm0) s = YMM0  /\
-   OPERAND256(%_% ymm1) s = YMM1  /\
-   OPERAND256(%_% ymm2) s = YMM2  /\
-   OPERAND256(%_% ymm3) s = YMM3  /\
-   OPERAND256(%_% ymm4) s = YMM4  /\
-   OPERAND256(%_% ymm5) s = YMM5  /\
-   OPERAND256(%_% ymm6) s = YMM6  /\
-   OPERAND256(%_% ymm7) s = YMM7  /\
-   OPERAND256(%_% ymm8) s = YMM8  /\
-   OPERAND256(%_% ymm9) s = YMM9  /\
-   OPERAND256(%_% ymm10) s = YMM10  /\
-   OPERAND256(%_% ymm11) s = YMM11  /\
-   OPERAND256(%_% ymm12) s = YMM12  /\
-   OPERAND256(%_% ymm13) s = YMM13  /\
-   OPERAND256(%_% ymm14) s = YMM14  /\
-   OPERAND256(%_% ymm15) s = YMM15  /\
+   OPERAND256(%_% ymm0) s = ZMM0 :> zerotop_256  /\
+   OPERAND256(%_% ymm1) s = ZMM1 :> zerotop_256  /\
+   OPERAND256(%_% ymm2) s = ZMM2 :> zerotop_256  /\
+   OPERAND256(%_% ymm3) s = ZMM3 :> zerotop_256  /\
+   OPERAND256(%_% ymm4) s = ZMM4 :> zerotop_256  /\
+   OPERAND256(%_% ymm5) s = ZMM5 :> zerotop_256  /\
+   OPERAND256(%_% ymm6) s = ZMM6 :> zerotop_256  /\
+   OPERAND256(%_% ymm7) s = ZMM7 :> zerotop_256  /\
+   OPERAND256(%_% ymm8) s = ZMM8 :> zerotop_256  /\
+   OPERAND256(%_% ymm9) s = ZMM9 :> zerotop_256  /\
+   OPERAND256(%_% ymm10) s = ZMM10 :> zerotop_256  /\
+   OPERAND256(%_% ymm11) s = ZMM11 :> zerotop_256  /\
+   OPERAND256(%_% ymm12) s = ZMM12 :> zerotop_256  /\
+   OPERAND256(%_% ymm13) s = ZMM13 :> zerotop_256  /\
+   OPERAND256(%_% ymm14) s = ZMM14 :> zerotop_256  /\
+   OPERAND256(%_% ymm15) s = ZMM15 :> zerotop_256  /\
    OPERAND256 (Memop Word256 bsid) s =
     memory :> bytes256 (bsid_semantics bsid s) /\
    OPERAND512(%_% zmm0) s = ZMM0  /\
@@ -5117,7 +5175,8 @@ let X86_CONV (decode_ths:thm option array) ths tm =
    REWRITE_CONV[READ_RVALUE;
                 ASSIGN_ZEROTOP_32; READ_ZEROTOP_32; WRITE_ZEROTOP_32;
                 ASSIGN_ZEROTOP_128; READ_ZEROTOP_128; WRITE_ZEROTOP_128;
-                READ_BOTTOM_128] THENC
+                ASSIGN_ZEROTOP_256; READ_ZEROTOP_256; WRITE_ZEROTOP_256;
+                READ_BOTTOM_128; READ_BOTTOM_256] THENC
    DEPTH_CONV WORD_NUM_RED_CONV THENC
    REWRITE_CONV[SEQ; condition_semantics] THENC
    REWRITE_CONV[bytesize] THENC (* bytesize in add_{load,store}_event *)
@@ -5128,7 +5187,8 @@ let X86_CONV (decode_ths:thm option array) ths tm =
    REWRITE_CONV[ASSIGNS_THM] THENC
    GEN_REWRITE_CONV TOP_DEPTH_CONV [SEQ_PULL_THM; BETA_THM] THENC
    GEN_REWRITE_CONV TOP_DEPTH_CONV[assign; seq; UNWIND_THM1; BETA_THM] THENC
-   TRY_CONV(REWRITE_CONV[WRITE_BOTTOM_128]) THENC
+   TRY_CONV(REWRITE_CONV[WRITE_BOTTOM_128; WRITE_BOTTOM_256;
+                         READ_BOTTOM_128; READ_BOTTOM_256]) THENC
    TRY_CONV(REWRITE_CONV READ_YMM_SSE_EQUIV) THENC
    REWRITE_CONV[] THENC REWRITE_CONV[WRITE_SHORT; READ_SHORT] THENC
    TOP_DEPTH_CONV COMPONENT_READ_OVER_WRITE_CONV THENC
