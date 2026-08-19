@@ -4,6 +4,8 @@
  *)
 
  needs "x86/proofs/base.ml";;
+
+x86_ymm_view := true;;  (* dual-view: legacy YMM view for this AVX2/SSE proof *)
  needs "x86/proofs/utils/keccak_spec.ml";;
 
 (**** print_literal_from_elf "x86/sha3/sha3_keccak4_f1600_alt.o";;

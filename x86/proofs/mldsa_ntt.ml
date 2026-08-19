@@ -8,6 +8,8 @@
 (* ========================================================================= *)
 
 needs "x86/proofs/base.ml";;
+
+x86_ymm_view := true;;  (* dual-view: legacy YMM view for this AVX2/SSE proof *)
 needs "common/mlkem_mldsa.ml";;
 
 (*** print_literal_from_elf "x86/mldsa/mldsa_ntt.o";;
