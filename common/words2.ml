@@ -459,4 +459,4 @@ let msimd16 = new_definition
 (* ------------------------------------------------------------------------- *)
 
 let simd32 = new_definition
-  `simd32 (f: N word -> N word -> N word) = simd2 (simd16 f)`;;
+ `simd32 (f: N word -> N word -> N word) = simd2 (simd16 f)`;;
