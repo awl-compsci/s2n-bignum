@@ -332,7 +332,22 @@ let MLKEM_TOBYTES_CORRECT = prove(
 
   MAP_EVERY (fun n ->
     X86_STEPS_TAC mlkem_tobytes_TMC_EXEC [n] THEN
-    SIMD_SIMPLIFY_TAC[])
+    (* ZMM view: SIMD_SIMPLIFY_TAC's simdable check only matches int256 reads,
+       so it skips the int512 `read ZMMn` assumptions and the word_subword/word_zx
+       cruft from the bit-packing accumulates (quadratic blowup). Simplify the
+       RHS of every SIMD-register read assumption (YMM/ZMM/XMM) regardless of
+       width, but leave memory/address/bytes_loaded assumptions untouched so the
+       self-modification check still goes through. *)
+    (RULE_ASSUM_TAC(fun th ->
+       let c = concl th in
+       if is_eq c &&
+          can (find_term (fun t -> is_const t &&
+             (let n = fst(dest_const t) in
+              String.length n >= 3 &&
+              (let s3 = String.sub n 0 3 in s3 = "YMM" || s3 = "ZMM" || s3 = "XMM"))))
+             (lhs c)
+       then (try CONV_RULE(RAND_CONV(SIMD_SIMPLIFY_CONV[])) th with Failure _ -> th)
+       else th)))
    (1--135) THEN
   ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
 
@@ -480,17 +495,14 @@ let MLKEM_TOBYTES_NOIBT_WINDOWS_SUBROUTINE_CORRECT = prove
   ENSURES_PRESERVED_TAC "init_xmm11" `ZMM11 :> bottomhalf :> bottomhalf` THEN
   ENSURES_PRESERVED_TAC "init_xmm12" `ZMM12 :> bottomhalf :> bottomhalf` THEN
 
-  REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER'] THEN
-  REWRITE_TAC(map GSYM
-    [YMM6;YMM7;YMM8;YMM9;YMM10;YMM11;YMM12]) THEN
-
-  GHOST_INTRO_TAC `init_ymm6:int256` `read YMM6` THEN
-  GHOST_INTRO_TAC `init_ymm7:int256` `read YMM7` THEN
-  GHOST_INTRO_TAC `init_ymm8:int256` `read YMM8` THEN
-  GHOST_INTRO_TAC `init_ymm9:int256` `read YMM9` THEN
-  GHOST_INTRO_TAC `init_ymm10:int256` `read YMM10` THEN
-  GHOST_INTRO_TAC `init_ymm11:int256` `read YMM11` THEN
-  GHOST_INTRO_TAC `init_ymm12:int256` `read YMM12` THEN
+  (     REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER] THEN
+     GHOST_INTRO_TAC `init_zmm6:(512)word` `read ZMM6` THEN
+     GHOST_INTRO_TAC `init_zmm7:(512)word` `read ZMM7` THEN
+     GHOST_INTRO_TAC `init_zmm8:(512)word` `read ZMM8` THEN
+     GHOST_INTRO_TAC `init_zmm9:(512)word` `read ZMM9` THEN
+     GHOST_INTRO_TAC `init_zmm10:(512)word` `read ZMM10` THEN
+     GHOST_INTRO_TAC `init_zmm11:(512)word` `read ZMM11` THEN
+     GHOST_INTRO_TAC `init_zmm12:(512)word` `read ZMM12`) THEN
 
   GLOBALIZE_PRECONDITION_TAC THEN
   REPEAT(FIRST_X_ASSUM(SUBST1_TAC o SYM)) THEN
@@ -512,13 +524,13 @@ let MLKEM_TOBYTES_NOIBT_WINDOWS_SUBROUTINE_CORRECT = prove
     RULE_ASSUM_TAC(CONV_RULE(TRY_CONV RIP_PLUS_CONV))] THEN
 
   MAP_EVERY ABBREV_TAC
-   [`ymm6_epilog = read YMM6 s13`;
-    `ymm7_epilog = read YMM7 s13`;
-    `ymm8_epilog = read YMM8 s13`;
-    `ymm9_epilog = read YMM9 s13`;
-    `ymm10_epilog = read YMM10 s13`;
-    `ymm11_epilog = read YMM11 s13`;
-    `ymm12_epilog = read YMM12 s13`] THEN
+   (     [`zmm6_epilog = read ZMM6 s13`;
+      `zmm7_epilog = read ZMM7 s13`;
+      `zmm8_epilog = read ZMM8 s13`;
+      `zmm9_epilog = read ZMM9 s13`;
+      `zmm10_epilog = read ZMM10 s13`;
+      `zmm11_epilog = read ZMM11 s13`;
+      `zmm12_epilog = read ZMM12 s13`]) THEN
 
   X86_STEPS_TAC mlkem_tobytes_windows_tmc_EXEC (14--24) THEN
 

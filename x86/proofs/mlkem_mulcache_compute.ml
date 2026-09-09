@@ -415,18 +415,19 @@ let MLKEM_MULCACHE_COMPUTE_NOIBT_WINDOWS_SUBROUTINE_CORRECT  = prove(
   ENSURES_PRESERVED_TAC "init_xmm9" `ZMM9 :> bottomhalf :> bottomhalf` THEN
   ENSURES_PRESERVED_TAC "init_xmm10" `ZMM10 :> bottomhalf :> bottomhalf` THEN
 
-(*** Handle the ZMM/YMM register notation conversion ***)
-  REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER'] THEN
-  REWRITE_TAC(map GSYM
-    [YMM6;YMM7;YMM8;YMM9;YMM10]) THEN
-
-(*** Introduce ghost variables for initial XMM register values
- *** These will track the register states for restoration in the epilogue ***)
-  GHOST_INTRO_TAC `init_ymm6:int256` `read YMM6` THEN
-  GHOST_INTRO_TAC `init_ymm7:int256` `read YMM7` THEN
-  GHOST_INTRO_TAC `init_ymm8:int256` `read YMM8` THEN
-  GHOST_INTRO_TAC `init_ymm9:int256` `read YMM9` THEN
-  GHOST_INTRO_TAC `init_ymm10:int256` `read YMM10` THEN
+(* Reduce the callee-saved XMM (bottom-quarter) preservation to a ghosted
+   initial register value. The two views differ only in the lens the SIMD
+   operands step through, so we ghost the register at the width the operands
+   resolve to: YMM (256-bit) under the folded YMM view, ZMM (512-bit) under
+   the ZMM-rooted view. Ghosting the full register is what makes the legacy
+   SSE `movups` save value state-free (so it survives DISCARD_OLDSTATE_TAC)
+   in the ZMM view. *)
+  (     REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER] THEN
+     GHOST_INTRO_TAC `init_zmm6:(512)word` `read ZMM6` THEN
+     GHOST_INTRO_TAC `init_zmm7:(512)word` `read ZMM7` THEN
+     GHOST_INTRO_TAC `init_zmm8:(512)word` `read ZMM8` THEN
+     GHOST_INTRO_TAC `init_zmm9:(512)word` `read ZMM9` THEN
+     GHOST_INTRO_TAC `init_zmm10:(512)word` `read ZMM10`) THEN
 
 (*** Globalize preconditions and substitute preserved register values ***)
   GLOBALIZE_PRECONDITION_TAC THEN
@@ -461,11 +462,11 @@ let MLKEM_MULCACHE_COMPUTE_NOIBT_WINDOWS_SUBROUTINE_CORRECT  = prove(
 
 (*** Capture the final YMM register states after main computation ***)
   MAP_EVERY ABBREV_TAC
-   [`ymm6_epilog = read YMM6 s13`;
-    `ymm7_epilog = read YMM7 s13`;
-    `ymm8_epilog = read YMM8 s13`;
-    `ymm9_epilog = read YMM9 s13`;
-    `ymm10_epilog = read YMM10 s13`] THEN
+   (     [`zmm6_epilog = read ZMM6 s13`;
+      `zmm7_epilog = read ZMM7 s13`;
+      `zmm8_epilog = read ZMM8 s13`;
+      `zmm9_epilog = read ZMM9 s13`;
+      `zmm10_epilog = read ZMM10 s13`]) THEN
 
 (*** Simulate the epilogue (register restoration and return)
  *** Steps 17-30 cover the Windows epilogue that restores XMM registers from stack ***)

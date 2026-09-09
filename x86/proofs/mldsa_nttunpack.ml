@@ -592,20 +592,24 @@ let MLDSA_NTTUNPACK_NOIBT_WINDOWS_SUBROUTINE_CORRECT = prove
   ENSURES_PRESERVED_TAC "init_xmm14" `ZMM14 :> bottomhalf :> bottomhalf` THEN
   ENSURES_PRESERVED_TAC "init_xmm15" `ZMM15 :> bottomhalf :> bottomhalf` THEN
 
-  REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER'] THEN
-  REWRITE_TAC(map GSYM
-    [YMM6;YMM7;YMM8;YMM9;YMM10;YMM11;YMM12;YMM13;YMM14;YMM15]) THEN
-
-  GHOST_INTRO_TAC `init_ymm6:int256` `read YMM6` THEN
-  GHOST_INTRO_TAC `init_ymm7:int256` `read YMM7` THEN
-  GHOST_INTRO_TAC `init_ymm8:int256` `read YMM8` THEN
-  GHOST_INTRO_TAC `init_ymm9:int256` `read YMM9` THEN
-  GHOST_INTRO_TAC `init_ymm10:int256` `read YMM10` THEN
-  GHOST_INTRO_TAC `init_ymm11:int256` `read YMM11` THEN
-  GHOST_INTRO_TAC `init_ymm12:int256` `read YMM12` THEN
-  GHOST_INTRO_TAC `init_ymm13:int256` `read YMM13` THEN
-  GHOST_INTRO_TAC `init_ymm14:int256` `read YMM14` THEN
-  GHOST_INTRO_TAC `init_ymm15:int256` `read YMM15` THEN
+  (* Reduce the callee-saved XMM (bottom-quarter) preservation to a ghosted
+     initial register value. The two views differ only in the lens the SIMD
+     operands step through, so we ghost the register at the width the operands
+     resolve to: YMM (256-bit) under the folded YMM view, ZMM (512-bit) under
+     the ZMM-rooted view. Ghosting the full register is what makes the legacy
+     SSE `movups` save value state-free (so it survives DISCARD_OLDSTATE_TAC)
+     in the ZMM view. *)
+  (     REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER] THEN
+     GHOST_INTRO_TAC `init_zmm6:(512)word` `read ZMM6` THEN
+     GHOST_INTRO_TAC `init_zmm7:(512)word` `read ZMM7` THEN
+     GHOST_INTRO_TAC `init_zmm8:(512)word` `read ZMM8` THEN
+     GHOST_INTRO_TAC `init_zmm9:(512)word` `read ZMM9` THEN
+     GHOST_INTRO_TAC `init_zmm10:(512)word` `read ZMM10` THEN
+     GHOST_INTRO_TAC `init_zmm11:(512)word` `read ZMM11` THEN
+     GHOST_INTRO_TAC `init_zmm12:(512)word` `read ZMM12` THEN
+     GHOST_INTRO_TAC `init_zmm13:(512)word` `read ZMM13` THEN
+     GHOST_INTRO_TAC `init_zmm14:(512)word` `read ZMM14` THEN
+     GHOST_INTRO_TAC `init_zmm15:(512)word` `read ZMM15`) THEN
 
   GLOBALIZE_PRECONDITION_TAC THEN
   REPEAT(FIRST_X_ASSUM(SUBST1_TAC o SYM)) THEN
@@ -627,16 +631,16 @@ let MLDSA_NTTUNPACK_NOIBT_WINDOWS_SUBROUTINE_CORRECT = prove
     RULE_ASSUM_TAC(CONV_RULE(TRY_CONV RIP_PLUS_CONV))] THEN
 
   MAP_EVERY ABBREV_TAC
-   [`ymm6_epilog = read YMM6 s14`;
-    `ymm7_epilog = read YMM7 s14`;
-    `ymm8_epilog = read YMM8 s14`;
-    `ymm9_epilog = read YMM9 s14`;
-    `ymm10_epilog = read YMM10 s14`;
-    `ymm11_epilog = read YMM11 s14`;
-    `ymm12_epilog = read YMM12 s14`;
-    `ymm13_epilog = read YMM13 s14`;
-    `ymm14_epilog = read YMM14 s14`;
-    `ymm15_epilog = read YMM15 s14`] THEN
+   (     [`zmm6_epilog = read ZMM6 s14`;
+       `zmm7_epilog = read ZMM7 s14`;
+       `zmm8_epilog = read ZMM8 s14`;
+       `zmm9_epilog = read ZMM9 s14`;
+       `zmm10_epilog = read ZMM10 s14`;
+       `zmm11_epilog = read ZMM11 s14`;
+       `zmm12_epilog = read ZMM12 s14`;
+       `zmm13_epilog = read ZMM13 s14`;
+       `zmm14_epilog = read ZMM14 s14`;
+       `zmm15_epilog = read ZMM15 s14`]) THEN
 
   X86_STEPS_TAC MLDSA_NTTUNPACK_WINDOWS_TMC_EXEC (15--27) THEN
 
@@ -825,20 +829,24 @@ let MLDSA_NTTUNPACK_NOIBT_WINDOWS_SUBROUTINE_SAFE = time prove
   ENSURES_PRESERVED_TAC "init_xmm14" `ZMM14 :> bottomhalf :> bottomhalf` THEN
   ENSURES_PRESERVED_TAC "init_xmm15" `ZMM15 :> bottomhalf :> bottomhalf` THEN
 
-  REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER'] THEN
-  REWRITE_TAC(map GSYM
-    [YMM6;YMM7;YMM8;YMM9;YMM10;YMM11;YMM12;YMM13;YMM14;YMM15]) THEN
-
-  GHOST_INTRO_TAC `init_ymm6:int256` `read YMM6` THEN
-  GHOST_INTRO_TAC `init_ymm7:int256` `read YMM7` THEN
-  GHOST_INTRO_TAC `init_ymm8:int256` `read YMM8` THEN
-  GHOST_INTRO_TAC `init_ymm9:int256` `read YMM9` THEN
-  GHOST_INTRO_TAC `init_ymm10:int256` `read YMM10` THEN
-  GHOST_INTRO_TAC `init_ymm11:int256` `read YMM11` THEN
-  GHOST_INTRO_TAC `init_ymm12:int256` `read YMM12` THEN
-  GHOST_INTRO_TAC `init_ymm13:int256` `read YMM13` THEN
-  GHOST_INTRO_TAC `init_ymm14:int256` `read YMM14` THEN
-  GHOST_INTRO_TAC `init_ymm15:int256` `read YMM15` THEN
+  (* Reduce the callee-saved XMM (bottom-quarter) preservation to a ghosted
+     initial register value. The two views differ only in the lens the SIMD
+     operands step through, so we ghost the register at the width the operands
+     resolve to: YMM (256-bit) under the folded YMM view, ZMM (512-bit) under
+     the ZMM-rooted view. Ghosting the full register is what makes the legacy
+     SSE `movups` save value state-free (so it survives DISCARD_OLDSTATE_TAC)
+     in the ZMM view. *)
+  (     REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER] THEN
+     GHOST_INTRO_TAC `init_zmm6:(512)word` `read ZMM6` THEN
+     GHOST_INTRO_TAC `init_zmm7:(512)word` `read ZMM7` THEN
+     GHOST_INTRO_TAC `init_zmm8:(512)word` `read ZMM8` THEN
+     GHOST_INTRO_TAC `init_zmm9:(512)word` `read ZMM9` THEN
+     GHOST_INTRO_TAC `init_zmm10:(512)word` `read ZMM10` THEN
+     GHOST_INTRO_TAC `init_zmm11:(512)word` `read ZMM11` THEN
+     GHOST_INTRO_TAC `init_zmm12:(512)word` `read ZMM12` THEN
+     GHOST_INTRO_TAC `init_zmm13:(512)word` `read ZMM13` THEN
+     GHOST_INTRO_TAC `init_zmm14:(512)word` `read ZMM14` THEN
+     GHOST_INTRO_TAC `init_zmm15:(512)word` `read ZMM15`) THEN
 
   GLOBALIZE_PRECONDITION_TAC THEN
   REPEAT(FIRST_X_ASSUM(SUBST1_TAC o SYM)) THEN
@@ -870,16 +878,16 @@ let MLDSA_NTTUNPACK_NOIBT_WINDOWS_SUBROUTINE_SAFE = time prove
     RULE_ASSUM_TAC(CONV_RULE(TRY_CONV RIP_PLUS_CONV))] THEN
 
   MAP_EVERY ABBREV_TAC
-   [`ymm6_epilog = read YMM6 s14`;
-    `ymm7_epilog = read YMM7 s14`;
-    `ymm8_epilog = read YMM8 s14`;
-    `ymm9_epilog = read YMM9 s14`;
-    `ymm10_epilog = read YMM10 s14`;
-    `ymm11_epilog = read YMM11 s14`;
-    `ymm12_epilog = read YMM12 s14`;
-    `ymm13_epilog = read YMM13 s14`;
-    `ymm14_epilog = read YMM14 s14`;
-    `ymm15_epilog = read YMM15 s14`] THEN
+   (     [`zmm6_epilog = read ZMM6 s14`;
+       `zmm7_epilog = read ZMM7 s14`;
+       `zmm8_epilog = read ZMM8 s14`;
+       `zmm9_epilog = read ZMM9 s14`;
+       `zmm10_epilog = read ZMM10 s14`;
+       `zmm11_epilog = read ZMM11 s14`;
+       `zmm12_epilog = read ZMM12 s14`;
+       `zmm13_epilog = read ZMM13 s14`;
+       `zmm14_epilog = read ZMM14 s14`;
+       `zmm15_epilog = read ZMM15 s14`]) THEN
 
   X86_STEPS_TAC MLDSA_NTTUNPACK_WINDOWS_TMC_EXEC (15--27) THEN
 

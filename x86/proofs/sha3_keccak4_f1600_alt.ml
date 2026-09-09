@@ -4,6 +4,44 @@
  *)
 
  needs "x86/proofs/base.ml";;
+
+(* YMM(256)->ZMM(512) analog of mlkem_rej's XMM_EXISTSTOP: given the low-256
+   read `read YMMn s = l` (= read (ZMMn:>zerotop_256) s), reconstruct the FULL
+   512-bit `read ZMMn s = word_join h l` with the upper 256 bits `h` as a ghost.
+   This roots the ZMM value in ghosts so the loop's 256-bit read-modify-writes
+   survive DISCARD_OLDSTATE instead of being dropped. *)
+let YMM_EXISTSTOP = prove
+ (`!c s:S. read (c :> zerotop_256) s = l
+           ==> ?h. read c s = (word_join:int256->int256->(512)word) h l`,
+  REPEAT STRIP_TAC THEN FIRST_X_ASSUM(SUBST1_TAC o SYM) THEN
+  EXISTS_TAC `word_subword (read c (s:S):(512)word) (256,256):int256` THEN
+  REWRITE_TAC[READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST);;
+let YMM_EXISTSTOP_RULE =
+  REWRITE_RULE (map GSYM
+   [YMM0; YMM1; YMM2; YMM3; YMM4; YMM5; YMM6; YMM7;
+    YMM8; YMM9; YMM10; YMM11; YMM12; YMM13; YMM14; YMM15]) o
+  C ISPEC YMM_EXISTSTOP;;
+let YMM_EXISTSTOP_TAC top y =
+  FIRST_X_ASSUM(MP_TAC o MATCH_MP (YMM_EXISTSTOP_RULE y)) THEN
+  DISCH_THEN(X_CHOOSE_TAC(mk_var(top,`:int256`)));;
+
+(* Per-bit BITBLAST.  A monolithic BITBLAST of a keccak lane-equality builds ONE
+   BDD for `AND(deep-XOR-theta, deep-XOR-theta)` and explodes (~48GB) on theta's
+   all-to-all XOR diffusion.  BITBLAST_THEN keeps the assumption context (so the
+   opaque state-read LHS gets resolved) and expands each lane to a conjunction of
+   per-bit equivalences; splitting that conjunction and proving each bit with its
+   own BDD_DEFTAUT keeps every BDD tiny -> RSS stays ~200-450MB.  Gc.compact()
+   every 128 bits bounds heap growth without the per-bit compaction stall. *)
+let PERBIT_BITBLAST : tactic =
+  let cnt = ref 0 in
+  BITBLAST_THEN (fun vars ->
+    REPEAT CONJ_TAC THEN
+    W(fun (_,w) ->
+       let th = prove(w, CONV_TAC(BDD_DEFTAUT vars)) in
+       incr cnt; (if !cnt mod 128 = 0 then Gc.compact());
+       ACCEPT_TAC th));;
+let PERLANE_BITBLAST : tactic = PERBIT_BITBLAST;;
+
  needs "x86/proofs/utils/keccak_spec.ml";;
 
 (**** print_literal_from_elf "x86/sha3/sha3_keccak4_f1600_alt.o";;
@@ -858,7 +896,10 @@ let SHA3_KECCAK4_F1600_ALT_CORRECT = prove
     REPEAT STRIP_TAC THEN
     X86_STEPS_TAC SHA3_KECCAK4_F1600_ALT_EXEC (1--96) THEN
     ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
-    REPEAT CONJ_TAC THENL 
+    (REWRITE_TAC[YMM2; YMM3; YMM7; YMM8; YMM9; YMM10; YMM13; YMM14; YMM15;
+                 READ_ZEROTOP_256] THEN
+     ASM_REWRITE_TAC[] THEN X86_YMM_RESUGAR_TAC) THEN
+    REPEAT CONJ_TAC THENL
     [PURE_ONCE_REWRITE_TAC[ARITH_RULE `8 * 0 = 0`] THEN
         REWRITE_TAC[WORD_ADD_0];
         ASM_REWRITE_TAC [WORD_SUBWORD_JOIN_EXTRACT_64] THEN
@@ -890,7 +931,25 @@ let SHA3_KECCAK4_F1600_ALT_CORRECT = prove
     ASM_REWRITE_TAC[IMP_IMP] THEN REWRITE_TAC[LENGTH_EQ_25] THEN
     DISCH_THEN(REPEAT_TCL CONJUNCTS_THEN SUBST1_TAC) THEN
     REWRITE_TAC[MAP2; CONS_11; GSYM CONJ_ASSOC] THEN
+    GHOST_INTRO_TAC `ymm2_init:int256` `read YMM2` THEN
+    GHOST_INTRO_TAC `ymm3_init:int256` `read YMM3` THEN
+    GHOST_INTRO_TAC `ymm7_init:int256` `read YMM7` THEN
+    GHOST_INTRO_TAC `ymm8_init:int256` `read YMM8` THEN
+    GHOST_INTRO_TAC `ymm9_init:int256` `read YMM9` THEN
+    GHOST_INTRO_TAC `ymm10_init:int256` `read YMM10` THEN
+    GHOST_INTRO_TAC `ymm13_init:int256` `read YMM13` THEN
+    GHOST_INTRO_TAC `ymm14_init:int256` `read YMM14` THEN
+    GHOST_INTRO_TAC `ymm15_init:int256` `read YMM15` THEN
     ENSURES_INIT_TAC "s0" THEN
+    YMM_EXISTSTOP_TAC "top2" `ZMM2` THEN
+    YMM_EXISTSTOP_TAC "top3" `ZMM3` THEN
+    YMM_EXISTSTOP_TAC "top7" `ZMM7` THEN
+    YMM_EXISTSTOP_TAC "top8" `ZMM8` THEN
+    YMM_EXISTSTOP_TAC "top9" `ZMM9` THEN
+    YMM_EXISTSTOP_TAC "top10" `ZMM10` THEN
+    YMM_EXISTSTOP_TAC "top13" `ZMM13` THEN
+    YMM_EXISTSTOP_TAC "top14" `ZMM14` THEN
+    YMM_EXISTSTOP_TAC "top15" `ZMM15` THEN
 
     SUBGOAL_THEN
      `read (memory :> bytes64(word_add rc_pointer (word(8 * i)))) s0 =
@@ -916,17 +975,20 @@ let SHA3_KECCAK4_F1600_ALT_CORRECT = prove
     ASM_REWRITE_TAC[WORD_ADD_0] THEN REPEAT STRIP_TAC THEN
     X86_STEPS_TAC SHA3_KECCAK4_F1600_ALT_EXEC (1--223) THEN
     ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
+    (REWRITE_TAC[YMM2; YMM3; YMM7; YMM8; YMM9; YMM10; YMM13; YMM14; YMM15;
+                 READ_ZEROTOP_256] THEN
+     ASM_REWRITE_TAC[] THEN X86_YMM_RESUGAR_TAC) THEN
     REPEAT CONJ_TAC THENL
       [REWRITE_TAC[WORD_ADD];
       CONV_TAC WORD_BLAST;
       REPEAT(CONJ_TAC THENL [CONV_TAC WORD_RULE]) THEN
       REWRITE_TAC[keccak; keccak_round] THEN
       CONV_TAC(ONCE_DEPTH_CONV EL_CONV) THEN
-      CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN 
+      CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
       REWRITE_TAC[MAP2; CONS_11] THEN
        CONV_TAC(ONCE_DEPTH_CONV EL_CONV) THEN
       ASM_REWRITE_TAC[] THEN
-      REPEAT CONJ_TAC THEN BITBLAST_TAC;
+      PERLANE_BITBLAST;
 
       REWRITE_TAC [WORD_BLAST `word_add x (word 18446744073709551593):int64 = 
               word_sub x (word 23)`] THEN
@@ -988,15 +1050,35 @@ let SHA3_KECCAK4_F1600_ALT_CORRECT = prove
     REWRITE_TAC[MAP2; CONS_11; GSYM CONJ_ASSOC] THEN 
     CONV_TAC NUM_REDUCE_CONV THEN
     REWRITE_TAC [keccak; keccak_round] THEN
+    GHOST_INTRO_TAC `ymm2_init:int256` `read YMM2` THEN
+    GHOST_INTRO_TAC `ymm3_init:int256` `read YMM3` THEN
+    GHOST_INTRO_TAC `ymm7_init:int256` `read YMM7` THEN
+    GHOST_INTRO_TAC `ymm8_init:int256` `read YMM8` THEN
+    GHOST_INTRO_TAC `ymm9_init:int256` `read YMM9` THEN
+    GHOST_INTRO_TAC `ymm10_init:int256` `read YMM10` THEN
+    GHOST_INTRO_TAC `ymm13_init:int256` `read YMM13` THEN
+    GHOST_INTRO_TAC `ymm14_init:int256` `read YMM14` THEN
+    GHOST_INTRO_TAC `ymm15_init:int256` `read YMM15` THEN
     ENSURES_INIT_TAC "s0" THEN
+    YMM_EXISTSTOP_TAC "top2" `ZMM2` THEN
+    YMM_EXISTSTOP_TAC "top3" `ZMM3` THEN
+    YMM_EXISTSTOP_TAC "top7" `ZMM7` THEN
+    YMM_EXISTSTOP_TAC "top8" `ZMM8` THEN
+    YMM_EXISTSTOP_TAC "top9" `ZMM9` THEN
+    YMM_EXISTSTOP_TAC "top10" `ZMM10` THEN
+    YMM_EXISTSTOP_TAC "top13" `ZMM13` THEN
+    YMM_EXISTSTOP_TAC "top14" `ZMM14` THEN
+    YMM_EXISTSTOP_TAC "top15" `ZMM15` THEN
     X86_STEPS_TAC SHA3_KECCAK4_F1600_ALT_EXEC (1--96) THEN
     REPEAT(FIRST_X_ASSUM(STRIP_ASSUME_TAC o
       CONV_RULE(READ_MEMORY_SPLIT_CONV 2) o
       check (can (term_match [] `read qqq s:int256 = xxx`) o concl))) THEN
     CONV_TAC(ONCE_DEPTH_CONV NORMALIZE_RELATIVE_ADDRESS_CONV) THEN
     ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
-    REPEAT CONJ_TAC THEN
-    BITBLAST_TAC]);;
+    (REWRITE_TAC[YMM2; YMM3; YMM7; YMM8; YMM9; YMM10; YMM13; YMM14; YMM15;
+                 READ_ZEROTOP_256] THEN
+     ASM_REWRITE_TAC[] THEN X86_YMM_RESUGAR_TAC) THEN
+    PERLANE_BITBLAST]);;
 
 
 let SHA3_KECCAK4_F1600_ALT_FULL_EXEC = X86_MK_EXEC_RULE sha3_keccak4_f1600_alt_tmc;;
@@ -1187,20 +1269,17 @@ let SHA3_KECCAK4_F1600_ALT_NOIBT_WINDOWS_SUBROUTINE_CORRECT = prove
   ENSURES_PRESERVED_TAC "init_xmm14" `ZMM14 :> bottomhalf :> bottomhalf` THEN
   ENSURES_PRESERVED_TAC "init_xmm15" `ZMM15 :> bottomhalf :> bottomhalf` THEN
 
-  REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER'] THEN
-  REWRITE_TAC(map GSYM
-    [YMM6;YMM7;YMM8;YMM9;YMM10;YMM11;YMM12;YMM13;YMM14;YMM15]) THEN
-
-  GHOST_INTRO_TAC `init_ymm6:int256` `read YMM6` THEN
-  GHOST_INTRO_TAC `init_ymm7:int256` `read YMM7` THEN
-  GHOST_INTRO_TAC `init_ymm8:int256` `read YMM8` THEN
-  GHOST_INTRO_TAC `init_ymm9:int256` `read YMM9` THEN
-  GHOST_INTRO_TAC `init_ymm10:int256` `read YMM10` THEN
-  GHOST_INTRO_TAC `init_ymm11:int256` `read YMM11` THEN
-  GHOST_INTRO_TAC `init_ymm12:int256` `read YMM12` THEN
-  GHOST_INTRO_TAC `init_ymm13:int256` `read YMM13` THEN
-  GHOST_INTRO_TAC `init_ymm14:int256` `read YMM14` THEN
-  GHOST_INTRO_TAC `init_ymm15:int256` `read YMM15` THEN
+  (REWRITE_TAC[READ_ZMM_BOTTOM_QUARTER] THEN
+     GHOST_INTRO_TAC `init_zmm6:(512)word` `read ZMM6` THEN
+     GHOST_INTRO_TAC `init_zmm7:(512)word` `read ZMM7` THEN
+     GHOST_INTRO_TAC `init_zmm8:(512)word` `read ZMM8` THEN
+     GHOST_INTRO_TAC `init_zmm9:(512)word` `read ZMM9` THEN
+     GHOST_INTRO_TAC `init_zmm10:(512)word` `read ZMM10` THEN
+     GHOST_INTRO_TAC `init_zmm11:(512)word` `read ZMM11` THEN
+     GHOST_INTRO_TAC `init_zmm12:(512)word` `read ZMM12` THEN
+     GHOST_INTRO_TAC `init_zmm13:(512)word` `read ZMM13` THEN
+     GHOST_INTRO_TAC `init_zmm14:(512)word` `read ZMM14` THEN
+     GHOST_INTRO_TAC `init_zmm15:(512)word` `read ZMM15`) THEN
 
   GLOBALIZE_PRECONDITION_TAC THEN
   REPEAT(FIRST_X_ASSUM(SUBST1_TAC o SYM)) THEN
@@ -1250,17 +1329,17 @@ let SHA3_KECCAK4_F1600_ALT_NOIBT_WINDOWS_SUBROUTINE_CORRECT = prove
     REWRITE_TAC[WORDLIST_FROM_MEMORY; DIMINDEX_8] THEN
     CONV_TAC(ONCE_DEPTH_CONV NUM_MULT_CONV) THEN
 
-    MAP_EVERY ABBREV_TAC
-   [`ymm6_epilog = read YMM6 s21`;
-    `ymm7_epilog = read YMM7 s21`;
-    `ymm8_epilog = read YMM8 s21`;
-    `ymm9_epilog = read YMM9 s21`;
-    `ymm10_epilog = read YMM10 s21`;
-    `ymm11_epilog = read YMM11 s21`;
-    `ymm12_epilog = read YMM12 s21`;
-    `ymm13_epilog = read YMM13 s21`;
-    `ymm14_epilog = read YMM14 s21`;
-    `ymm15_epilog = read YMM15 s21`] THEN
+    (MAP_EVERY ABBREV_TAC
+   [`zmm6_epilog = read ZMM6 s21`;
+    `zmm7_epilog = read ZMM7 s21`;
+    `zmm8_epilog = read ZMM8 s21`;
+    `zmm9_epilog = read ZMM9 s21`;
+    `zmm10_epilog = read ZMM10 s21`;
+    `zmm11_epilog = read ZMM11 s21`;
+    `zmm12_epilog = read ZMM12 s21`;
+    `zmm13_epilog = read ZMM13 s21`;
+    `zmm14_epilog = read ZMM14 s21`;
+    `zmm15_epilog = read ZMM15 s21`]) THEN
 
   X86_STEPS_TAC sha3_keccak4_f1600_alt_windows_tmc_EXEC (22--36) THEN
 
