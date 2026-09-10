@@ -220,6 +220,11 @@ let decode = new_definition `!w:int32. decode w =
     SOME ((if sf then (if op then arm_CBNZ else arm_CBZ) (XREG' Rt)
                  else (if op then arm_CBNZ else arm_CBZ) (WREG' Rt))
       (word (val imm19 * 4)))
+  | [b5; 0b011011:6; op; b40:5; imm14:14; Rt:5] ->
+    SOME ((if b5 then (if op then arm_TBNZ else arm_TBZ) (XREG' Rt)
+                 else (if op then arm_TBNZ else arm_TBZ) (WREG' Rt))
+      ((if b5 then 32 else 0) + val b40)
+      (word (val imm14 * 4)))
   | [sf; op; 0b011010100:9; Rm:5; cond:4; 0:1; o2; Rn:5; Rd:5] ->
     SOME ((if sf
       then arm_csop op o2 (XREG' Rd) (XREG' Rn) (XREG' Rm)
@@ -898,6 +903,46 @@ let decode = new_definition `!w:int32. decode w =
     let esize = 8 * 2 EXP val sz in
     let datasize = if q then 128 else 64 in
     SOME (arm_SQRDMULH_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize datasize)
+
+  | [0:1; q; 0b001111:6; sz:2; L:1; M:1; R:4; 0b0010:4; H:1; 0:1; Rn:5; Rd:5] ->
+    // SMLAL / SMLAL2 (by element): signed widening multiply-accumulate.
+    // The second operand is the single lane Vm.<T>[ix], broadcast across all
+    // destination lanes via QLANE (LANE_H/LANE_S duplicate the lane).  Q
+    // selects the SMLAL2 (high-half of Vn) vs SMLAL (low-half) semantics.
+    // Only sz=01 (.h, esize=16) and sz=10 (.s, esize=32) are defined.
+    if sz = word 0b00 \/ sz = word 0b11 then NONE else // "UNDEFINED"
+    let ix = if sz = word 0b01 then 4 * val H + 2 * val L + val M
+             else 2 * val H + val L in
+    let Rm = if sz = word 0b01 then word_zx R else word_join M R in
+    let esize = 8 * 2 EXP val sz in
+    if q then
+      SOME (arm_SMLAL2_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize)
+    else
+      SOME (arm_SMLAL_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize)
+
+  | [0:1; q; 0b101111:6; sz:2; L:1; M:1; R:4; 0b1010:4; H:1; 0:1; Rn:5; Rd:5] ->
+    // UMULL / UMULL2 (by element): unsigned widening multiply-long.
+    if sz = word 0b00 \/ sz = word 0b11 then NONE else // "UNDEFINED"
+    let ix = if sz = word 0b01 then 4 * val H + 2 * val L + val M
+             else 2 * val H + val L in
+    let Rm = if sz = word 0b01 then word_zx R else word_join M R in
+    let esize = 8 * 2 EXP val sz in
+    if q then
+      SOME (arm_UMULL2_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize)
+    else
+      SOME (arm_UMULL_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize)
+
+  | [0:1; q; 0b101111:6; sz:2; L:1; M:1; R:4; 0b0110:4; H:1; 0:1; Rn:5; Rd:5] ->
+    // UMLSL / UMLSL2 (by element): unsigned widening multiply-subtract-long.
+    if sz = word 0b00 \/ sz = word 0b11 then NONE else // "UNDEFINED"
+    let ix = if sz = word 0b01 then 4 * val H + 2 * val L + val M
+             else 2 * val H + val L in
+    let Rm = if sz = word 0b01 then word_zx R else word_join M R in
+    let esize = 8 * 2 EXP val sz in
+    if q then
+      SOME (arm_UMLSL2_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize)
+    else
+      SOME (arm_UMLSL_VEC (QREG' Rd) (QREG' Rn) (QLANE Rm esize ix) esize)
 
   | [0:1; q; 0b101110:6; sz:2; 1:1; Rm:5; 0b101101:6; Rn:5; Rd:5] ->
     // SQRDMULH (vector)
