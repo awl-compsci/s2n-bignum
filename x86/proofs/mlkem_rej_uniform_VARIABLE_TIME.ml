@@ -8,6 +8,7 @@
 (* ========================================================================= *)
 
 needs "x86/proofs/base.ml";;
+
 needs "common/mlkem_mldsa.ml";;
 
 (**** print_literal_from_elf "x86/mlkem/mlkem_rej_uniform_VARIABLE_TIME.o";;
@@ -386,6 +387,9 @@ let REJ_SAMPLE_APPEND = prove
 (* Tactics for mapping XMM assumptions into YMM ones.                        *)
 (* ------------------------------------------------------------------------- *)
 
+let scontains s sub = let n=String.length sub and m=String.length s in let rec go i = i+n<=m && (String.sub s i n = sub || go(i+1)) in n<=m && go 0;;
+let rec tsize t = match t with Comb(a,b) -> 1+tsize a+tsize b | Abs(_,b) -> 1+tsize b | _ -> 1;;
+
 let XMM_EXISTSTOP = prove
  (`!c s:S. read (c :> zerotop_128) s = l
            ==> ?h. read c s = (word_join:int128->int128->int256) h l`,
@@ -443,6 +447,59 @@ let lemma3 = prove
          ==> word_and (word_subword (q:int128) (12*i,16)) (word 4095) =
              (word_zx:12 word->int16) (word_subword (q:int128) (12*i,12))`,
   CONV_TAC WORD_BLAST);;
+
+(* ZMM view only.  The MOVQ+PINSRD recombination rewrite (near the top of the
+   loop body) wraps the source of the rejection mask as
+   `word_zx (word_subword q0 (0,96))`.  After the coeff fold the 12-bit
+   extractions read `word_subword (word_zx (word_subword q0 (0,96))) (12k,12)`;
+   since 12k+12 <= 96 this equals `word_subword q0 (12k,12)`, i.e. the same
+   coefficient the `x` abbreviation names.  Collapse the wrapper so the mask
+   folds to `x k` and the val(x k)<3329 case split concretizes the table index. *)
+let COLLAPSE_ZX96 = prove
+ ((rand o concl o (EXPAND_CASES_CONV THENC NUM_REDUCE_CONV))
+  `!k. k < 8
+       ==> word_subword
+             (word_zx (word_subword (q:int128) (0,96):(96)word):int128)
+             (12*k,12):(12)word =
+           word_subword q (12*k,12)`,
+  CONV_TAC WORD_BLAST);;
+
+let idxref = ref TRUTH;;
+let xref = ref TRUTH;;
+(* Split an int256 equality into its 16 independent 16-bit lanes so each is a
+   small, fast WORD_BLAST (and any genuine per-lane discrepancy is localized). *)
+let LANE_SPLIT_256 =
+  let mk i = subst [mk_small_numeral(16*i),`k:num`]
+    `word_subword (a:int256)(k,16):int16 = word_subword (b:int256)(k,16)` in
+  let ant = list_mk_conj (map mk (0--15)) in
+  WORD_BLAST(mk_imp(ant,`(a:int256) = b`));;
+let LANE_SPLIT_512 =
+  let mk i = subst [mk_small_numeral(16*i),`k:num`]
+    `word_subword (a:(512)word)(k,16):int16 = word_subword (b:(512)word)(k,16)` in
+  let ant = list_mk_conj (map mk (0--31)) in
+  WORD_BLAST(mk_imp(ant,`(a:(512)word) = b`));;
+let z2ref = ref TRUTH;;
+let is_q2v_def th = (match concl th with Comb(Comb(Const("=",_),_),Var("q2v",_)) -> true | _ -> false);;
+let dcontains hay sub = let n=String.length sub and m=String.length hay in
+  let rec go i = i+n<=m && (String.sub hay i n = sub || go(i+1)) in n<=m && go 0;;
+
+(* ZMM view: SIMD_SIMPLIFY_TAC's simdable check only matches int256 reads, so it
+   skips the int512 `read ZMMn` assumptions and the word_subword/word_zx cruft
+   from the SSE partial-writes accumulates (quadratic blowup -> STATE_UPDATE
+   discard). Simplify the RHS of every SIMD-register read assumption
+   (YMM/ZMM/XMM) regardless of width, leaving memory/address assumptions
+   untouched so the self-modification check still goes through. *)
+let ZMM_SIMD_SIMPLIFY_TAC =
+  RULE_ASSUM_TAC(fun th ->
+     let c = concl th in
+     if is_eq c &&
+        can (find_term (fun t -> is_const t &&
+           (let nm = fst(dest_const t) in
+            String.length nm >= 3 &&
+            (let s3 = String.sub nm 0 3 in s3 = "YMM" || s3 = "ZMM" || s3 = "XMM"))))
+           (lhs c)
+     then (try CONV_RULE(RAND_CONV(SIMD_SIMPLIFY_CONV[])) th with Failure _ -> th)
+     else th);;
 
 let MLKEM_REJ_UNIFORM_CORRECT = prove
  (`!res buf buflen table (inlist:(12 word)list) pc stackpointer.
@@ -555,15 +612,27 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
     GHOST_INTRO_TAC `ymm4_init:int256` `read YMM4` THEN
     GHOST_INTRO_TAC `ymm5_init:int256` `read YMM5` THEN
     ENSURES_INIT_TAC "s0" THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (1--16) THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (1--16) THEN
+    X86_YMM_RESUGAR_TAC THEN ZMM_SIMD_SIMPLIFY_TAC THEN
     ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
     RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV)) THEN
     RULE_ASSUM_TAC(CONV_RULE WORD_REDUCE_CONV) THEN
     ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
+    (* ZMM view: the XMM constant invariants come out as word_zx(read YMMk s16).
+       Unfold the YMM->ZMM aliases IN THE GOAL, substitute the surviving
+       read ZMMk s16 = word_join(..const..) (kept by VSTEPS), collapse the
+       word_zx round-trips, then WORD_BLAST closes them (the low 128 is the
+       loaded constant; the ZMM high bits are irrelevant subwords). *)
+    REWRITE_TAC[YMM0; YMM4; YMM5; READ_ZEROTOP_256] THEN
+    ASM_REWRITE_TAC[] THEN
+    CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+    SIMP_TAC[WORD_ZX_ZX; DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+             ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+             ARITH_RULE `256 <= 512`] THEN
     REPEAT(CONJ_TAC THENL [CONV_TAC WORD_BLAST; ALL_TAC]) THEN
     CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
     REWRITE_TAC[MULT_CLAUSES; SUB_LIST_CLAUSES; REJ_SAMPLE_EMPTY;
-                LENGTH; READ_MEMORY_BYTES_TRIVIAL; num_of_wordlist];
+                LENGTH; READ_MEMORY_BYTES_TRIVIAL; num_of_wordlist] ;
 
     (*** Main invariant preservation proof for the loop ***)
 
@@ -575,9 +644,12 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
     ABBREV_TAC `curlen = LENGTH(curlist:int16 list)` THEN
     CONV_TAC(RATOR_CONV(LAND_CONV(TOP_DEPTH_CONV let_CONV))) THEN
     ASM_REWRITE_TAC[] THEN
-    GHOST_INTRO_TAC `ymm1_init:int256` `read YMM1` THEN
-    GHOST_INTRO_TAC `ymm2_init:int256` `read YMM2` THEN
-    GHOST_INTRO_TAC `ymm3_init:int256` `read YMM3` THEN
+    (* ZMM view: ghost the FULL int512 ZMM1/2/3 (not just int256 YMM) so the
+       legacy-SSE partial-writes reference these ghost vars instead of old-state
+       read ZMMn s0; else DISCARD_OLDSTATE drops every SIMD write. *)
+    GHOST_INTRO_TAC `zmm1_init:(512)word` `read ZMM1` THEN
+    GHOST_INTRO_TAC `zmm2_init:(512)word` `read ZMM2` THEN
+    GHOST_INTRO_TAC `zmm3_init:(512)word` `read ZMM3` THEN
 
     ENSURES_INIT_TAC "s0" THEN
     XMM_EXISTSTOP_TAC "top0" `YMM0` THEN
@@ -615,7 +687,9 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
     ASSUME_TAC(WORD_RULE
      `!x. word (1 * val(word x:int64)):int64 = word x`) THEN
     MAP_EVERY (fun n ->
-      X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC [n] THEN
+      X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [n] THEN
+      X86_YMM_RESUGAR_TAC THEN
+      ZMM_SIMD_SIMPLIFY_TAC THEN
       RULE_ASSUM_TAC(REWRITE_RULE[WORD_SUBWORD_AND]) THEN
       RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV (WORD_SIMPLE_SUBWORD_CONV))) THEN
       RULE_ASSUM_TAC(CONV_RULE WORD_REDUCE_CONV))
@@ -644,15 +718,63 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
 
     (*** Perform the table lookup ****)
 
+    X86_YMM_RESUGAR_TAC THEN
+    RULE_ASSUM_TAC(REWRITE_RULE[WORD_SUBWORD_AND]) THEN
+    RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV)) THEN
+    RULE_ASSUM_TAC(CONV_RULE WORD_REDUCE_CONV) THEN
     REABBREV_TAC `idx = read R10 s12` THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC [13] THEN
+    FIRST_ASSUM(fun th -> let c = concl th in
+      if is_eq c && is_var(rhs c) && fst(dest_var(rhs c)) = "idx"
+      then (idxref := th; ALL_TAC) else failwith "cap idx") THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [13] THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
     RULE_ASSUM_TAC(REWRITE_RULE[WORD_RULE
      `word_shl x 4:int64 = word(16 * val x)`]) THEN
     ABBREV_TAC
      `tab =
       read (memory :> bytes128(word_add table (word(16 * val(idx:int64)))))
            s13` THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (14--15) THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [14] THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
+    FIRST_ASSUM(fun th -> if is_eq(concl th) && lhs(concl th) = `read ZMM2 s14`
+                          then (z2ref := th; ALL_TAC) else failwith "cap z2") THEN
+    SUBGOAL_THEN `?hi4u:int256. read ZMM4 s2:(512)word = word_join hi4u (read YMM4 s2)`
+      (X_CHOOSE_THEN `hi4u:int256` ASSUME_TAC) THENL
+     [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word)(256,256):int256` THEN
+      REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+    SUBGOAL_THEN `?hi5u:int256. read ZMM5 s6:(512)word = word_join hi5u (read YMM5 s6)`
+      (X_CHOOSE_THEN `hi5u:int256` ASSUME_TAC) THENL
+     [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word)(256,256):int256` THEN
+      REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+    SUBGOAL_THEN
+     `read ZMM2 s14 =
+      (word_join:int256->int256->(512)word)
+        (word_subword (zmm2_init:(512)word)(256,256))
+        ((word_join:int128->int128->int256) (word_subword zmm2_init (128,128))
+         ((word_join:int64->int64->int128)
+          ((word_join:int32->int32->int64)
+           ((word_join:int16->int16->int32) (word_zx(word_subword (q0:int128)(84,12):12 word))
+                                             (word_zx(word_subword q0 (72,12):12 word)))
+           ((word_join:int16->int16->int32) (word_zx(word_subword q0 (60,12):12 word))
+                                             (word_zx(word_subword q0 (48,12):12 word))))
+          ((word_join:int32->int32->int64)
+           ((word_join:int16->int16->int32) (word_zx(word_subword q0 (36,12):12 word))
+                                             (word_zx(word_subword q0 (24,12):12 word)))
+           ((word_join:int16->int16->int32) (word_zx(word_subword q0 (12,12):12 word))
+                                             (word_zx(word_subword q0 (0,12):12 word))))))`
+     ASSUME_TAC THENL
+     [ASM_REWRITE_TAC[] THEN
+      MATCH_MP_TAC LANE_SPLIT_512 THEN REPEAT CONJ_TAC THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN CONV_TAC WORD_BLAST;
+      ALL_TAC] THEN
+    FIRST_X_ASSUM(fun th -> if concl th = concl(!z2ref) then ALL_TAC
+                            else failwith "drop old z2") THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [15] THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
 
     (*** Further simplify ***)
 
@@ -672,10 +794,12 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
      `(x:num->int16) j =
       word_zx(word_subword (q0:int128) (12 * j,12):12 word)` THEN
     FIRST_ASSUM(fun th ->
+      xref := th;
       MP_TAC(end_itlist CONJ (map (C SPEC th o mk_small_numeral) (0--7)))) THEN
     CONV_TAC(LAND_CONV NUM_REDUCE_CONV) THEN
     DISCH_THEN(fun th -> RULE_ASSUM_TAC(REWRITE_RULE[th])) THEN
-
+    
+    
     (**** Later in the proof, we actually want this equivalent ***)
 
     SUBGOAL_THEN
@@ -722,18 +846,38 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       REWRITE_TAC[LENGTH_SUB_LIST] THEN
       SIMPLE_ARITH_TAC;
       ALL_TAC] THEN
+    
+    
 
     (*** The table-based selection, brute forced by case analysis ***)
 
     SUBGOAL_THEN
-     `read YMM2 s15 =
-      (word_join:int128->int128->int256)
-      (word_subword (ymm2_init:int256) (128,128))
-      (word(num_of_wordlist
-         (FILTER (\x. val x < 3329)
-                 [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7])))`
+     `read ZMM2 s15 =
+      (word_join:int256->int256->(512)word)
+       (word_subword (zmm2_init:(512)word) (256,256))
+       ((word_join:int128->int128->int256)
+        (word_subword (zmm2_init:(512)word) (128,128))
+        (word(num_of_wordlist
+           (FILTER (\x. val x < 3329)
+                   [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7]))))`
     MP_TAC THENL
-     [UNDISCH_TAC
+     [SUBGOAL_THEN
+        `?hi4:int256. read ZMM4 s2:(512)word = word_join hi4 (read YMM4 s2)`
+        (X_CHOOSE_THEN `hi4:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN
+        `?hi5:int256. read ZMM5 s6:(512)word = word_join hi5 (read YMM5 s6)`
+        (X_CHOOSE_THEN `hi5:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN
+        `?hi0:int256. read ZMM0 s7:(512)word = word_join hi0 (read YMM0 s7)`
+        (X_CHOOSE_THEN `hi0:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM0 s7:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM0; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      REWRITE_TAC[YMM2; READ_ZEROTOP_256] THEN
+      UNDISCH_TAC
        `read(memory :> bytes(table,4096)) s15 =
         num_of_wordlist mlkem_rej_uniform_table` THEN
       REPLICATE_TAC 4
@@ -744,13 +888,75 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       CONV_TAC(LAND_CONV BYTES_EQ_NUM_OF_WORDLIST_EXPAND_CONV) THEN
       REWRITE_TAC[GSYM BYTES128_WBYTES] THEN REPEAT STRIP_TAC THEN
       ASM_REWRITE_TAC[] THEN
+      W(fun _ -> ASSUME_TAC(!idxref)) THEN
+      (* read ZMM2 s15's gather (carrying `tab` and the mask) is already in the
+         goal (ASM_REWRITE above the bridges).  Expand `tab`/`idx` to expose the
+         table read and the mask. *)
       MAP_EVERY EXPAND_TAC ["tab"; "idx"] THEN
+      (* Drop the `tab` and `idx` abbreviation hyps (`read(..table..) = tab`,
+         `<mask> = idx`).  Both are still symbolic pre-case-split, so a
+         subsequent ASM_REWRITE would otherwise re-fold the expanded terms back
+         into `tab`/`idx` (undoing the EXPAND above). *)
+      REPEAT(FIRST_X_ASSUM(fun th ->
+        if is_eq(concl th) && is_var(rhs(concl th)) &&
+           (let n = fst(dest_var(rhs(concl th))) in n = "tab" || n = "idx")
+        then ALL_TAC else failwith "keep")) THEN
+      (* Drop the x-abbreviation assumption (`!j. word_zx(word_subword q0 (12j,12))
+         = x j`) so the resolve ASM_REWRITE below does NOT fold some word_zx
+         coefficients to `x` -- that would leave the LHS in a mixed x / word_zx
+         form the word_zx case split cannot concretize.  Everything stays word_zx;
+         the RHS is unfolded to word_zx via the !xref ref (not this assumption). *)
+      W(fun _ -> FIRST_X_ASSUM(fun th ->
+        if concl th = concl(!xref) then ALL_TAC else failwith "keep")) THEN
+      (* Resolve the pshufb controls (ZMM4/ZMM5/ZMM0 -> constants via the hi4/
+         hi5/hi0 bridges + loop-invariant XMM constants) and evaluate the byte
+         shuffle so the rejection mask becomes a byte-join over q0 (the same
+         recipe the unpack fold uses for the data-path controls). *)
+      ASM_REWRITE_TAC[] THEN
+      CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN
+      (* Fold the mask's 12-bit coeff extractions to `x k` and the comparison to
+         `val(x k) < 3329`.  lemma1b first, so the word_ushr(word_join ..) forms
+         (odd coeffs) are consumed before lemma1a rewrites their inner joins;
+         then COLLAPSE_ZX96 strips the word_zx(word_subword q0 (0,96)) wrapper.
+         This is the ZMM-view analogue of what YMM view folds during stepping;
+         with the mask in x-form the val(x k)<3329 case split below concretizes
+         the gather index (the table memory read is then a concrete constant). *)
+      REWRITE_TAC[lemma1b] THEN REWRITE_TAC[lemma1a] THEN
+      REWRITE_TAC[lemma3] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_and ((word_zx:12 word->int16) x) (word 4095) = word_zx x`] THEN
+      REWRITE_TAC[COLLAPSE_ZX96] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_igt (word 3329:int16) (word_zx(x:12 word)) <=>
+        val(word_zx x:int16) < 3329`] THEN
+      (* Both the (huge) LHS gather and the mask are now in
+         `word_zx(word_subword q0 (12k,12))` form, while the RHS FILTER still uses
+         the abbreviation `x k`.  Unfold `x k -> word_zx(word_subword q0 (12k,12))`
+         in the RHS ONLY (RAND_CONV cannot reach the LHS, so the rewriter never
+         traverses/rewrites the huge term -> no stack overflow).  Now every
+         coefficient is in one form and the word_zx case split below decides
+         both the gather index and the FILTER. *)
+      
+      (* Flip xref (`!j. word_zx(word_subword q0 (12j,12)) = x j`) to unfold
+         `x j`, quantifying ONLY j so x and q0 stay fixed.  (Plain GSYM would
+         GEN_ALL x and q0 too, making `x j` a schematic pattern that matches any
+         application and diverges.) *)
+      W(fun _ -> CONV_TAC(RAND_CONV(
+         REWRITE_CONV[GEN `j:num` (SYM(SPEC `j:num` (!xref)))] THENC
+         ONCE_DEPTH_CONV NUM_MULT_CONV))) THEN
+      
       REWRITE_TAC[bitval] THEN
       MAP_EVERY ASM_CASES_TAC
-       [`val(x 0:int16) < 3329`; `val(x 1:int16) < 3329`;
-        `val(x 2:int16) < 3329`; `val(x 3:int16) < 3329`;
-        `val(x 4:int16) < 3329`; `val(x 5:int16) < 3329`;
-        `val(x 6:int16) < 3329`; `val(x 7:int16) < 3329`] THEN
+       [`val(word_zx(word_subword (q0:int128) (0,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (12,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (24,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (36,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (48,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (60,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (72,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (84,12):12 word):int16) < 3329`] THEN
       ASM_REWRITE_TAC[FILTER] THEN
       CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
       ASM_REWRITE_TAC[WORD_ADD_0] THEN
@@ -758,13 +964,26 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
       REPLICATE_TAC 3 (ONCE_REWRITE_TAC[GSYM NUM_OF_PAIR_WORDLIST]) THEN
       REWRITE_TAC[pair_wordlist; NUM_OF_WORDLIST_SING; WORD_VAL] THEN
-      REWRITE_TAC[num_of_wordlist] THEN CONV_TAC WORD_BLAST;
-      DISCARD_MATCHING_ASSUMPTIONS [`read YMM2 s = x`] THEN STRIP_TAC] THEN
-
+      REWRITE_TAC[num_of_wordlist] THEN
+      (* Per branch the mask is now concrete, so the residual is small.  The
+         gather DATA on the LHS is in `x k` form (folded at the loop body) while
+         the RHS/filter is in `word_zx(word_subword q0 (12k,12))` form; fold the
+         latter back to `x k` (safe: word_zx pattern on the LHS of the rule, and
+         the term is small post-split so no stack blow-up) so both sides match. *)
+      W(fun _ -> REWRITE_TAC(map
+         (CONV_RULE(ONCE_DEPTH_CONV NUM_MULT_CONV) o C SPEC (!xref) o
+          mk_small_numeral) (0--7))) THEN
+      CONV_TAC WORD_BLAST;
+      DISCARD_MATCHING_ASSUMPTIONS [`read ZMM2 s = x`; `read YMM2 s = x`] THEN
+      STRIP_TAC] THEN
+    
+    
     (*** The writeback and popcount ***)
 
     VAL_INT64_TAC `curlen:num` THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (16--17) THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (16--17) THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
     RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV (WORD_SIMPLE_SUBWORD_CONV))) THEN
 
     (*** The counting part, similarly brute-forced, though it's easier ***)
@@ -773,15 +992,55 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
      `read R11 s17 = word(LENGTH (FILTER (\x. val x < 3329)
                        [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7]))`
     MP_TAC THENL
-     [ASM_REWRITE_TAC[] THEN
+     [
+      ASM_REWRITE_TAC[] THEN
+      
       FIRST_X_ASSUM(fun th ->
         GEN_REWRITE_TAC (LAND_CONV o RAND_CONV o RAND_CONV) [SYM th]) THEN
+      
+      (* ZMM view: the popcount's mask `idx` is the same raw word_condense over
+         word_zx pshufb coefficients as in the table-selection subgoal.  Resolve
+         the pshufb controls (ZMM4/ZMM5/ZMM0 bridges) and fold the 12-bit coeff
+         extractions to `x k` so the val(x k)<3329 COND_CASES below reduces the
+         popcount (this goal is small, so folding word_zx->x on the whole goal
+         does not blow the rewriter stack). *)
+      SUBGOAL_THEN `?hi4:int256. read ZMM4 s2:(512)word = word_join hi4 (read YMM4 s2)`
+        (X_CHOOSE_THEN `hi4:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN `?hi5:int256. read ZMM5 s6:(512)word = word_join hi5 (read YMM5 s6)`
+        (X_CHOOSE_THEN `hi5:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN `?hi0:int256. read ZMM0 s7:(512)word = word_join hi0 (read YMM0 s7)`
+        (X_CHOOSE_THEN `hi0:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM0 s7:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM0; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      ASM_REWRITE_TAC[] THEN
+      CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN
+      REWRITE_TAC[lemma1b] THEN REWRITE_TAC[lemma1a] THEN
+      REWRITE_TAC[lemma3] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_and ((word_zx:12 word->int16) x) (word 4095) = word_zx x`] THEN
+      REWRITE_TAC[COLLAPSE_ZX96] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_igt (word 3329:int16) (word_zx(x:12 word)) <=>
+        val(word_zx x:int16) < 3329`] THEN
+      
+      W(fun _ -> REWRITE_TAC(map
+         (CONV_RULE(ONCE_DEPTH_CONV NUM_MULT_CONV) o C SPEC (!xref) o
+          mk_small_numeral) (0--7))) THEN
+      
       REPEAT(ONCE_REWRITE_TAC[FILTER] THEN REWRITE_TAC[] THEN
              COND_CASES_TAC THEN ASM_REWRITE_TAC[]) THEN
-      DISCARD_STATE_TAC "s17" THEN REWRITE_TAC[BITVAL_CLAUSES] THEN
+      
+      TRY(DISCARD_STATE_TAC "s17") THEN REWRITE_TAC[BITVAL_CLAUSES] THEN
       CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
       REWRITE_TAC[LENGTH; FILTER] THEN CONV_TAC NUM_REDUCE_CONV THEN REFL_TAC;
       DISCARD_MATCHING_ASSUMPTIONS [`read R11 s = x`] THEN STRIP_TAC] THEN
+    
 
     (*** Handle the overlapping writebacks, first some initialization ***)
 
@@ -789,6 +1048,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
      [`lis = FILTER (\x. val x < 3329)
                     [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7]`;
       `len = LENGTH(lis:int16 list)`] THEN
+    
 
     SUBGOAL_THEN `len <= 8` ASSUME_TAC THENL
      [MAP_EVERY EXPAND_TAC ["len"; "lis"] THEN
@@ -796,6 +1056,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       W(MP_TAC o PART_MATCH lhand LENGTH_FILTER o lhand o snd) THEN
       REWRITE_TAC[LENGTH] THEN ARITH_TAC;
       ALL_TAC] THEN
+    
 
     ABBREV_TAC `curlist':int16 list = APPEND curlist lis` THEN
     ABBREV_TAC `curlen':num = curlen + len` THEN
@@ -829,6 +1090,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       ASM_REWRITE_TAC[DIMINDEX_16] THEN
       UNDISCH_TAC `len <= 8` THEN ARITH_TAC;
       ALL_TAC] THEN
+    
 
     SUBGOAL_THEN `LENGTH(curlist':int16 list) = curlen'` ASSUME_TAC THENL
      [MAP_EVERY EXPAND_TAC ["curlist'"; "curlen'"] THEN
@@ -880,7 +1142,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
       REPLICATE_TAC 3 (CONJ_TAC THENL [CONV_TAC WORD_BLAST; ALL_TAC]) THEN
       CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
-      ASM_REWRITE_TAC[GSYM WORD_ADD] THEN CONV_TAC WORD_RULE;
+      ASM_REWRITE_TAC[GSYM WORD_ADD] THEN CONV_TAC WORD_RULE ;
 
       X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (18--20) THEN
       POP_ASSUM MP_TAC THEN
@@ -891,7 +1153,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
         ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
         REPLICATE_TAC 3 (CONJ_TAC THENL [CONV_TAC WORD_BLAST; ALL_TAC]) THEN
         CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
-        ASM_REWRITE_TAC[GSYM WORD_ADD] THEN CONV_TAC WORD_RULE;
+        ASM_REWRITE_TAC[GSYM WORD_ADD] THEN CONV_TAC WORD_RULE ;
         X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (21--23) THEN
         ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN CONJ_TAC THENL
          [MATCH_MP_TAC(TAUT `p ==> (if ~p then x else y) = y`) THEN
@@ -919,7 +1181,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
           ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
           REPLICATE_TAC 3 (CONJ_TAC THENL [CONV_TAC WORD_BLAST; ALL_TAC]) THEN
           CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
-          ASM_REWRITE_TAC[GSYM WORD_ADD] THEN CONV_TAC WORD_RULE]]];
+          ASM_REWRITE_TAC[GSYM WORD_ADD] THEN CONV_TAC WORD_RULE ]]];
 
     (*** The copying to the output and final reasoning ***)
 
@@ -957,9 +1219,12 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
     RULE_ASSUM_TAC(REWRITE_RULE[WORD_RULE
      `word_shl (word n) 1 = word(2 * n)`]) THEN
     VAL_INT64_TAC `2 * MIN 256 outlen` THEN
+    
     X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [7] THEN
+    
     FIRST_X_ASSUM(MP_TAC o check
       (can (term_match [] `z = read c (write c y s)`) o concl)) THEN
+    
     SIMP_TAC[READ_WRITE_X86_STRINGCOPY; ARITH_RULE
         `2 * MIN 256 l < 2 EXP 64`] THEN
     W(MP_TAC o PART_MATCH (lhand o rand) X86_STRINGCOPY_NONOVERLAPPING o
@@ -967,9 +1232,12 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
     ANTS_TAC THENL
      [CONJ_TAC THENL [ARITH_TAC; NONOVERLAPPING_TAC];
       DISCH_THEN SUBST1_TAC THEN DISCH_TAC] THEN
+    
     ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
+    
     CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
     ASM_REWRITE_TAC[GSYM REJ_SAMPLE] THEN
+    
     MP_TAC(ISPECL
      [`res:int64`; `LENGTH(SUB_LIST (0,256) (REJ_SAMPLE inlist))`;
       `2 * LENGTH(SUB_LIST (0,256) (REJ_SAMPLE inlist))`;
@@ -977,6 +1245,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
      (INST_TYPE [`:16`,`:N`] WORDLIST_FROM_MEMORY_EQ_ALT)) THEN
     ASM_REWRITE_TAC[ARITH_RULE `8 * 2 * n = 16 * n`; DIMINDEX_16] THEN
     DISCH_THEN(fun th -> REWRITE_TAC[th]) THEN
+    
     SUBGOAL_THEN
      `read (memory :> bytes (stackpointer,2 * MIN 256 outlen)) s6 =
       num_of_wordlist (SUB_LIST (0,256) outlist:int16 list)`
@@ -985,20 +1254,21 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
       REWRITE_TAC[NUM_OF_WORDLIST_SUB_LIST_0; DIMINDEX_16] THEN
       FIRST_X_ASSUM(fun th ->
         GEN_REWRITE_TAC (RAND_CONV o LAND_CONV) [SYM th]) THEN
-      REWRITE_TAC[ARITH_RULE `2 * MIN 256 l = MIN (2 * l) 512`] THEN
-      REWRITE_TAC[ARITH_RULE `16 * 256 = 8 * 512`] THEN
-      REWRITE_TAC[READ_COMPONENT_COMPOSE; READ_BYTES_MOD] THEN
-      ONCE_REWRITE_TAC[ARITH_RULE `MIN a b = MIN b a`] THEN
-      REWRITE_TAC[GSYM READ_BYTES_MOD] THEN
-      AP_THM_TAC THEN AP_TERM_TAC THEN
-      REWRITE_TAC[GSYM READ_COMPONENT_COMPOSE] THEN
-      REWRITE_TAC[ARITH_RULE `512 = 8 * 64`] THEN
-      CONV_TAC(ONCE_DEPTH_CONV BIGNUM_LEXPAND_CONV) THEN
-      RULE_ASSUM_TAC(CONV_RULE(ONCE_DEPTH_CONV(READ_MEMORY_SPLIT_CONV 1))) THEN
-      ASM_REWRITE_TAC[];
+      (* Both sides reduce to reading MIN(2*outlen)512 bytes of the same memory.
+         Use targeted GEN_REWRITE_TAC (no TOP_DEPTH/basic-rewrite reduction of
+         the `2 EXP (8 * 512)` modulus, which would break READ_BYTES_MOD's
+         `2 EXP (8 * n)` pattern) then REFL. *)
+      REWRITE_TAC[ARITH_RULE `2 * MIN 256 l = MIN (2 * l) 512`;
+                  ARITH_RULE `16 * 256 = 8 * 512`] THEN
+      GEN_REWRITE_TAC (RATOR_CONV o ONCE_DEPTH_CONV) [READ_COMPONENT_COMPOSE] THEN
+      GEN_REWRITE_TAC (RAND_CONV o ONCE_DEPTH_CONV) [READ_COMPONENT_COMPOSE] THEN
+      GEN_REWRITE_TAC (RAND_CONV) [READ_BYTES_MOD] THEN
+      REFL_TAC;
       ALL_TAC] THEN
+    
     FIRST_X_ASSUM DISJ_CASES_TAC THENL
-     [SUBGOAL_THEN `SUB_LIST (0,8 * N) (inlist:(12 word)list) = inlist`
+     [
+      SUBGOAL_THEN `SUB_LIST (0,8 * N) (inlist:(12 word)list) = inlist`
       SUBST_ALL_TAC THENL
        [MATCH_MP_TAC SUB_LIST_REFL THEN FIRST_X_ASSUM(MATCH_MP_TAC o
         MATCH_MP
@@ -1007,7 +1277,9 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
         FIRST_X_ASSUM(MP_TAC o GEN_REWRITE_RULE I [divides]) THEN
         SIMP_TAC[LEFT_IMP_EXISTS_THM; LE_MULT_LCANCEL; LT_MULT_LCANCEL] THEN
         ARITH_TAC;
-        ASM_REWRITE_TAC[LENGTH_SUB_LIST; SUB_0]];
+        
+        ASM_REWRITE_TAC[LENGTH_SUB_LIST; SUB_0] ];
+      
       ASM_REWRITE_TAC[GSYM NOT_LE; LENGTH_SUB_LIST; SUB_0] THEN
       ASM_SIMP_TAC[ARITH_RULE `256 <= n ==> MIN 256 n = 256`] THEN
       MATCH_MP_TAC(MESON[]
@@ -1021,7 +1293,7 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
           SUB_LIST_TOPSPLIT) THEN
         DISCH_THEN(fun th ->
           GEN_REWRITE_TAC (funpow 3 RAND_CONV) [SYM th]) THEN
-        REWRITE_TAC[REJ_SAMPLE_APPEND; LENGTH_APPEND; LE_ADD];
+        REWRITE_TAC[REJ_SAMPLE_APPEND; LENGTH_APPEND; LE_ADD] ;
         DISCH_THEN SUBST1_TAC] THEN
       SUBGOAL_THEN
        `SUB_LIST (0,256) (REJ_SAMPLE inlist) = SUB_LIST (0,256) outlist`
@@ -1029,11 +1301,13 @@ let MLKEM_REJ_UNIFORM_CORRECT = prove
        [MP_TAC(ISPECL [`inlist:(12 word)list`; `8 * N`]
           SUB_LIST_TOPSPLIT) THEN
         DISCH_THEN(fun th -> ONCE_REWRITE_TAC[SYM th]) THEN
-        ASM_SIMP_TAC[REJ_SAMPLE_APPEND; SUB_LIST_APPEND_LEFT];
+        ASM_SIMP_TAC[REJ_SAMPLE_APPEND; SUB_LIST_APPEND_LEFT] ;
         ALL_TAC] THEN
+      
       FIRST_ASSUM(SUBST1_TAC o MATCH_MP (ARITH_RULE
        `256 <= l ==> 2 * 256 = 2 * MIN 256 l`)) THEN
-      FIRST_ASSUM ACCEPT_TAC]]);;
+      
+      (FIRST_ASSUM ACCEPT_TAC ORELSE ASM_REWRITE_TAC[] )]]);;
 
 let MLKEM_REJ_UNIFORM_NOIBT_SUBROUTINE_CORRECT = prove
  (`!res buf buflen table (inlist:(12 word)list) pc stackpointer returnaddress.
@@ -1119,6 +1393,37 @@ let mlkem_rej_uniform_windows_mc = define_from_elf "mlkem_rej_uniform_windows_mc
 let mlkem_rej_uniform_windows_tmc =
   define_trimmed "mlkem_rej_uniform_windows_tmc" mlkem_rej_uniform_windows_mc;;
 
+let mlkem_rej_uniform_windows_tmc_EXEC =
+  X86_MK_EXEC_RULE mlkem_rej_uniform_windows_tmc;;
+
+(* Bare-read normalisation of the table/buf wordlist_from_memory preconditions.
+   A read buried inside wordlist_of_num is dropped by DISCARD_OLDSTATE during
+   stepping (only bare `read c s = v` assumptions are carried forward), so the
+   Windows wrapper must expose the reads before X86_STEPS. *)
+let WLM_TABLE_EQ = prove
+ (`!(a:int64) s.
+      wordlist_from_memory(a,4096) s:byte list = mlkem_rej_uniform_table <=>
+      LENGTH(mlkem_rej_uniform_table:byte list) = 4096 /\
+      read(memory:>bytes(a,4096)) s = num_of_wordlist mlkem_rej_uniform_table`,
+  REPEAT GEN_TAC THEN
+  MATCH_MP_TAC(INST_TYPE [`:8`,`:N`] WORDLIST_FROM_MEMORY_EQ_ALT) THEN
+  REWRITE_TAC[DIMINDEX_8] THEN ARITH_TAC);;
+
+(* Same bare-read normalisation for the 16-bit output list (res).  Here
+   16 = 8 * 2 makes the size side-condition unconditional. *)
+let WLM_RES_EQ = prove
+ (`!(a:int64) (l:(16 word)list) s.
+     wordlist_from_memory(a,LENGTH l) s = l <=>
+     read(memory:>bytes(a,2 * LENGTH l)) s = num_of_wordlist l`,
+  REPEAT GEN_TAC THEN
+  MP_TAC(ISPECL[`a:int64`; `LENGTH(l:(16 word)list)`;
+                `2 * LENGTH(l:(16 word)list)`; `l:(16 word)list`; `s:x86state`]
+    (INST_TYPE [`:16`,`:N`] WORDLIST_FROM_MEMORY_EQ_ALT)) THEN
+  ANTS_TAC THENL [REWRITE_TAC[DIMINDEX_16] THEN ARITH_TAC; ALL_TAC] THEN
+  DISCH_THEN SUBST1_TAC THEN REWRITE_TAC[]);;
+
+let win_buf_iff = ref TRUTH;;
+
 let MLKEM_REJ_UNIFORM_NOIBT_WINDOWS_SUBROUTINE_CORRECT = time prove
  (`!res buf buflen table (inlist:(12 word)list) pc stackpointer returnaddress.
       12 divides val buflen /\
@@ -1150,17 +1455,78 @@ let MLKEM_REJ_UNIFORM_NOIBT_WINDOWS_SUBROUTINE_CORRECT = time prove
            WINDOWS_MAYCHANGE_REGS_AND_FLAGS_PERMITTED_BY_ABI ,,
            MAYCHANGE [memory :> bytes(res,512);
                       memory :> bytes(word_sub stackpointer (word 544),544)])`,
-  let TWEAK_CONV =
-    TOP_DEPTH_CONV let_CONV THENC
-    REWRITE_CONV[wordlist_from_memory] THENC
-    TOP_DEPTH_CONV DIMINDEX_CONV THENC
-    ONCE_REWRITE_CONV [ARITH_RULE `x = 12 * y <=> 12 * y = x`] THENC
-    SIMP_CONV[] THENC NUM_REDUCE_CONV in
-  CONV_TAC TWEAK_CONV THEN
-  WINDOWS_X86_WRAP_STACK_TAC
-    mlkem_rej_uniform_windows_tmc mlkem_rej_uniform_tmc
-    (CONV_RULE TWEAK_CONV MLKEM_REJ_UNIFORM_CORRECT)
-    `[]` 528);;
+  
+  REPLICATE_TAC 6 GEN_TAC THEN
+  WORD_FORALL_OFFSET_TAC 544 THEN REPEAT GEN_TAC THEN
+  
+  REWRITE_TAC[fst mlkem_rej_uniform_windows_tmc_EXEC] THEN
+  REWRITE_TAC[ALL] THEN
+  REPEAT STRIP_TAC THEN
+  
+  (* Expose the table/buf reads (see WLM_TABLE_EQ note above) before stepping. *)
+  SUBGOAL_THEN
+   `!s:x86state.
+       wordlist_from_memory(buf,LENGTH(inlist:(12 word)list)) s = inlist <=>
+       LENGTH(inlist:(12 word)list) = LENGTH inlist /\
+       read(memory:>bytes(buf,val(buflen:int64))) s = num_of_wordlist inlist`
+   (fun bth -> win_buf_iff := bth; REWRITE_TAC[bth]) THENL
+   [GEN_TAC THEN MATCH_MP_TAC(INST_TYPE [`:12`,`:N`] WORDLIST_FROM_MEMORY_EQ_ALT) THEN
+    REWRITE_TAC[DIMINDEX_12] THEN ASM_ARITH_TAC;
+    ALL_TAC] THEN
+  REWRITE_TAC[WLM_TABLE_EQ] THEN
+  
+  REWRITE_TAC[WINDOWS_C_ARGUMENTS; WINDOWS_C_RETURN] THEN
+  REWRITE_TAC[WINDOWS_MAYCHANGE_REGS_AND_FLAGS_PERMITTED_BY_ABI] THEN
+  
+  (* mlkem_rej uses xmm3 in place of xmm6, so the Windows prologue/epilogue only
+     saves/restores rdi/rsi; the nonvolatile xmm6-15 are never touched so their
+     preservation is automatic.  WINDOWS_X86_WRAP_STACK_TAC mis-counts under the
+     ZMM operand view, so we do the wrap manually (mirrors mldsa_rej). *)
+  ENSURES_PRESERVED_TAC "rdi_init" `RDI` THEN
+  ENSURES_PRESERVED_TAC "rsi_init" `RSI` THEN
+  
+  GLOBALIZE_PRECONDITION_TAC THEN
+  
+  ENSURES_INIT_TAC "s0" THEN
+  X86_STEPS_TAC mlkem_rej_uniform_windows_tmc_EXEC (1--7) THEN
+  
+  W(fun _ -> MP_TAC(REWRITE_RULE[WLM_TABLE_EQ; !win_buf_iff]
+    (SPECL
+      [`res:int64`; `buf:int64`; `buflen:int64`; `table:int64`;
+       `inlist:(12 word)list`; `pc + 14`; `stackpointer:int64`]
+      MLKEM_REJ_UNIFORM_CORRECT))) THEN
+  ASM_REWRITE_TAC[C_ARGUMENTS; SOME_FLAGS] THEN
+  
+  ANTS_TAC THENL
+   [REWRITE_TAC[ALL] THEN REPEAT CONJ_TAC THEN
+    (FIRST_ASSUM ACCEPT_TAC ORELSE NONOVERLAPPING_TAC ORELSE ASM_ARITH_TAC);
+    ALL_TAC] THEN
+  
+  X86_BIGSTEP_TAC mlkem_rej_uniform_windows_tmc_EXEC "s8" THENL
+   [REPEAT CONJ_TAC THEN
+    ((FIRST_ASSUM(MATCH_ACCEPT_TAC o MATCH_MP
+       (BYTES_LOADED_SUBPROGRAM_RULE mlkem_rej_uniform_windows_tmc
+       (REWRITE_RULE[BUTLAST_CLAUSES]
+        (AP_TERM `BUTLAST:byte list->byte list` mlkem_rej_uniform_tmc))
+       14))
+     ORELSE (CONV_TAC WORD_RULE THEN NO_TAC)
+     ORELSE (ASM_REWRITE_TAC[] THEN NO_TAC))
+     );
+    RULE_ASSUM_TAC(CONV_RULE(TRY_CONV RIP_PLUS_CONV))] THEN
+  
+  RULE_ASSUM_TAC(CONV_RULE(DEPTH_CONV let_CONV)) THEN
+  
+  (* Expose the res output-list read (buried in wordlist_from_memory) as a bare
+     memory read so X86_STEPS carries it across the epilogue. *)
+  RULE_ASSUM_TAC(REWRITE_RULE[WLM_RES_EQ]) THEN
+  RULE_ASSUM_TAC(REWRITE_RULE[C_RETURN]) THEN
+  
+  X86_STEPS_TAC mlkem_rej_uniform_windows_tmc_EXEC (9--12) THEN
+  
+  ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
+  CONV_TAC(DEPTH_CONV let_CONV) THEN
+  REWRITE_TAC[WLM_RES_EQ; C_RETURN] THEN ASM_REWRITE_TAC[] THEN
+  REPEAT CONJ_TAC THEN CONV_TAC WORD_BLAST);;
 
 let MLKEM_REJ_UNIFORM_WINDOWS_SUBROUTINE_CORRECT = time prove
  (`!res buf buflen table (inlist:(12 word)list) pc stackpointer returnaddress.
@@ -1221,6 +1587,99 @@ let DISCHARGE_MEMSAFE_TAC:tactic =
   SAFE_META_EXISTS_TAC allowed_vars_e THEN
   CONJ_TAC THENL [ EXISTS_E2_TAC allowed_vars_e; ALL_TAC ] THEN
   DISCHARGE_MEMACCESS_INBOUNDS_TAC;;
+
+(* Like SIMPLE_ARITH_TAC but allows `val` in assumptions since
+   contained_modulo bounds may involve val terms. Filters out
+   read/write/word simulation cruft that makes ASM_ARITH_TAC slow. *)
+let (MEMSAFE_ARITH_TAC:tactic) =
+  let numty = `:num` in
+  let is_num_relop tm =
+    exists (fun op -> is_binary op tm &&
+                      (let x,_ = dest_binary op tm in type_of x = numty))
+           ["=";"<";"<=";">";">="]
+  and avoiders = ["lowdigits"; "highdigits"; "bigdigit";
+                  "read"; "write"; "word"] in
+  let avoiderp tm =
+    match tm with Const(n,_) -> mem n avoiders | _ -> false in
+  let filtered tm =
+    (is_num_relop tm || (is_neg tm && is_num_relop (dest_neg tm))) &&
+    not(can (find_term avoiderp) tm) in
+  let tweak = GEN_REWRITE_RULE TRY_CONV [ARITH_RULE `~(n = 0) <=> 1 <= n`] in
+  W(fun (asl,w) ->
+    let asl' = filter (fun (_,th) -> filtered(concl th)) asl in
+    MAP_EVERY (MP_TAC o tweak o snd) asl' THEN CONV_TAC ARITH_RULE);;
+
+(* ASM-aware version of CONTAINED_TAC for loop-body proofs where
+   memory addresses involve symbolic loop variables. Uses MEMSAFE_ARITH_TAC
+   which filters assumptions to avoid the performance issues of ASM_ARITH_TAC
+   with hundreds of symbolic simulation assumptions. *)
+let CONTAINED_ASM_TAC =
+  GEN_REWRITE_TAC I [GSYM CONTAINED_MODULO_MOD2] THEN
+  GEN_REWRITE_TAC (BINOP_CONV o LAND_CONV o LAND_CONV o TOP_DEPTH_CONV)
+   [VAL_WORD_ADD; VAL_WORD; DIMINDEX_64] THEN
+  CONV_TAC(BINOP_CONV(LAND_CONV MOD_DOWN_CONV)) THEN
+  GEN_REWRITE_TAC I [CONTAINED_MODULO_MOD2] THEN
+  ((GEN_REWRITE_TAC I [CONTAINED_MODULO_REFL] THEN
+    MEMSAFE_ARITH_TAC) ORELSE
+   (MATCH_MP_TAC CONTAINED_MODULO_OFFSET_SIMPLE THEN
+    MEMSAFE_ARITH_TAC) ORELSE
+   (MATCH_MP_TAC CONTAINED_MODULO_SIMPLE THEN MEMSAFE_ARITH_TAC));;
+
+(* ASM-aware version of DISCHARGE_MEMSAFE_TAC for loop bodies.
+   Uses MEMSAFE_ARITH_TAC for contained_modulo proofs with symbolic bounds. *)
+let DISCHARGE_MEMSAFE_ASM_TAC:tactic =
+  SAFE_META_EXISTS_TAC allowed_vars_e THEN
+  CONJ_TAC THENL [ EXISTS_E2_TAC allowed_vars_e; ALL_TAC ] THEN
+  REWRITE_TAC[MEMACCESS_INBOUNDS_APPEND] THEN
+  CONJ_TAC THENL
+   [REWRITE_TAC[memaccess_inbounds; ALL; EX; FST; SND] THEN
+    REPEAT CONJ_TAC THEN
+    REPEAT ((DISJ1_TAC THEN CONTAINED_ASM_TAC) ORELSE DISJ2_TAC ORELSE
+                CONTAINED_ASM_TAC) THEN
+    NO_TAC;
+    REWRITE_TAC[APPEND; APPEND_NIL] THEN
+    FIRST_ASSUM ACCEPT_TAC];;
+
+(* Variant of DISCARD_OLDSTATE_TAC that never discards a `read events sN = ..`
+   hypothesis, even though the accumulated events transitively reference earlier
+   states (via SIMD memory-access operands).  Without this the events chain -- the
+   core of the memory-safety proof -- is erased by the branch stepping's discard,
+   and DISCHARGE_MEMSAFE_ASM_TAC's EXISTS_E2_TAC then fails (AP_THM_TAC).  Mirrors
+   mldsa_rej_uniform_VARIABLE_TIME.ml's fix. *)
+let DISCARD_OLDSTATE_KEEP_EVENTS_TAC (s:string) =
+  let v = mk_var(s, `:x86state`) in
+  let rec unbound_statevars_of_read bound_svars tm =
+    match tm with
+      Comb(Comb(Const("read",_),cmp),s) ->
+        if mem s bound_svars then [] else [s]
+    | Comb(a,b) -> union (unbound_statevars_of_read bound_svars a)
+                         (unbound_statevars_of_read bound_svars b)
+    | Abs(v,t) -> unbound_statevars_of_read (v::bound_svars) t
+    | _ -> [] in
+  let is_events_hyp tm =
+    is_eq tm &&
+    (try let l = lhs tm in
+         let f, args = strip_comb l in
+         fst(dest_const f) = "read" &&
+         List.length args = 2 &&
+         fst(dest_const(List.hd args)) = "events"
+     with _ -> false) in
+  DISCARD_ASSUMPTIONS_TAC(
+    fun thm ->
+      if is_events_hyp (concl thm) then false
+      else
+        let us = unbound_statevars_of_read [] (concl thm) in
+        if us = [] || us = [v] then false
+        else if not(mem v us) then true
+        else true);;
+
+let X86_SINGLE_STEP_KEEP_EVENTS_TAC th s =
+  time (X86_VERBOSE_STEP_TAC th s) THEN
+  DISCARD_OLDSTATE_KEEP_EVENTS_TAC s THEN
+  CLARIFY_TAC;;
+
+let X86_STEPS_KEEP_EVENTS_TAC th snums =
+  MAP_EVERY (X86_SINGLE_STEP_KEEP_EVENTS_TAC th) (statenames "s" snums);;
 
 let MLKEM_REJ_UNIFORM_MEMSAFE = prove
  (`!res buf buflen table (inlist:(12 word)list) e pc stackpointer.
@@ -1340,11 +1799,23 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
     GHOST_INTRO_TAC `ymm4_init:int256` `read YMM4` THEN
     GHOST_INTRO_TAC `ymm5_init:int256` `read YMM5` THEN
     ENSURES_INIT_TAC "s0" THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (1--16) THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (1--16) THEN
+    X86_YMM_RESUGAR_TAC THEN ZMM_SIMD_SIMPLIFY_TAC THEN
     ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
     RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV)) THEN
     RULE_ASSUM_TAC(CONV_RULE WORD_REDUCE_CONV) THEN
     ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
+    (* ZMM view: the XMM constant invariants come out as word_zx(read YMMk s16).
+       Unfold the YMM->ZMM aliases IN THE GOAL, substitute the surviving
+       read ZMMk s16 = word_join(..const..) (kept by VSTEPS), collapse the
+       word_zx round-trips, then WORD_BLAST closes them (the low 128 is the
+       loaded constant; the ZMM high bits are irrelevant subwords). *)
+    REWRITE_TAC[YMM0; YMM4; YMM5; READ_ZEROTOP_256] THEN
+    ASM_REWRITE_TAC[] THEN
+    CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+    SIMP_TAC[WORD_ZX_ZX; DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+             ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+             ARITH_RULE `256 <= 512`] THEN
     REPEAT(CONJ_TAC THENL [CONV_TAC WORD_BLAST; ALL_TAC]) THEN
     CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
     REWRITE_TAC[MULT_CLAUSES; SUB_LIST_CLAUSES; REJ_SAMPLE_EMPTY;
@@ -1361,9 +1832,9 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
     ABBREV_TAC `curlen = LENGTH(curlist:int16 list)` THEN
     CONV_TAC(RATOR_CONV(LAND_CONV(TOP_DEPTH_CONV let_CONV))) THEN
     ASM_REWRITE_TAC[] THEN
-    GHOST_INTRO_TAC `ymm1_init:int256` `read YMM1` THEN
-    GHOST_INTRO_TAC `ymm2_init:int256` `read YMM2` THEN
-    GHOST_INTRO_TAC `ymm3_init:int256` `read YMM3` THEN
+    GHOST_INTRO_TAC `zmm1_init:(512)word` `read ZMM1` THEN
+    GHOST_INTRO_TAC `zmm2_init:(512)word` `read ZMM2` THEN
+    GHOST_INTRO_TAC `zmm3_init:(512)word` `read ZMM3` THEN
 
     ENSURES_INIT_TAC "s0" THEN
     (* Strip the event accumulator from the invariant *)
@@ -1404,7 +1875,9 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
     ASSUME_TAC(WORD_RULE
      `!x. word (1 * val(word x:int64)):int64 = word x`) THEN
     MAP_EVERY (fun n ->
-      X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC [n] THEN
+      X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [n] THEN
+      X86_YMM_RESUGAR_TAC THEN
+      ZMM_SIMD_SIMPLIFY_TAC THEN
       RULE_ASSUM_TAC(REWRITE_RULE[WORD_SUBWORD_AND]) THEN
       RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV (WORD_SIMPLE_SUBWORD_CONV))) THEN
       RULE_ASSUM_TAC(CONV_RULE WORD_REDUCE_CONV))
@@ -1432,15 +1905,64 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
     RULE_ASSUM_TAC(REWRITE_RULE[TAUT `(if p then T else F) <=> p`]) THEN
 
     (* Table lookup, same as CORRECT *)
+    X86_YMM_RESUGAR_TAC THEN
+    RULE_ASSUM_TAC(REWRITE_RULE[WORD_SUBWORD_AND]) THEN
+    RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV)) THEN
+    RULE_ASSUM_TAC(CONV_RULE WORD_REDUCE_CONV) THEN
     REABBREV_TAC `idx = read R10 s12` THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC [13] THEN
+    FIRST_ASSUM(fun th -> let c = concl th in
+      if is_eq c && is_var(rhs c) && fst(dest_var(rhs c)) = "idx"
+      then (idxref := th; ALL_TAC) else failwith "cap idx") THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [13] THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
     RULE_ASSUM_TAC(REWRITE_RULE[WORD_RULE
      `word_shl x 4:int64 = word(16 * val x)`]) THEN
     ABBREV_TAC
      `tab =
       read (memory :> bytes128(word_add table (word(16 * val(idx:int64)))))
            s13` THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (14--15) THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [14] THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
+    FIRST_ASSUM(fun th -> if is_eq(concl th) && lhs(concl th) = `read ZMM2 s14`
+                          then (z2ref := th; ALL_TAC) else failwith "cap z2") THEN
+    SUBGOAL_THEN `?hi4u:int256. read ZMM4 s2:(512)word = word_join hi4u (read YMM4 s2)`
+      (X_CHOOSE_THEN `hi4u:int256` ASSUME_TAC) THENL
+     [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word)(256,256):int256` THEN
+      REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+    SUBGOAL_THEN `?hi5u:int256. read ZMM5 s6:(512)word = word_join hi5u (read YMM5 s6)`
+      (X_CHOOSE_THEN `hi5u:int256` ASSUME_TAC) THENL
+     [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word)(256,256):int256` THEN
+      REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+    SUBGOAL_THEN
+     `read ZMM2 s14 =
+      (word_join:int256->int256->(512)word)
+        (word_subword (zmm2_init:(512)word)(256,256))
+        ((word_join:int128->int128->int256) (word_subword zmm2_init (128,128))
+         ((word_join:int64->int64->int128)
+          ((word_join:int32->int32->int64)
+           ((word_join:int16->int16->int32) (word_zx(word_subword (q0:int128)(84,12):12 word))
+                                             (word_zx(word_subword q0 (72,12):12 word)))
+           ((word_join:int16->int16->int32) (word_zx(word_subword q0 (60,12):12 word))
+                                             (word_zx(word_subword q0 (48,12):12 word))))
+          ((word_join:int32->int32->int64)
+           ((word_join:int16->int16->int32) (word_zx(word_subword q0 (36,12):12 word))
+                                             (word_zx(word_subword q0 (24,12):12 word)))
+           ((word_join:int16->int16->int32) (word_zx(word_subword q0 (12,12):12 word))
+                                             (word_zx(word_subword q0 (0,12):12 word))))))`
+     ASSUME_TAC THENL
+     [ASM_REWRITE_TAC[] THEN
+      MATCH_MP_TAC LANE_SPLIT_512 THEN REPEAT CONJ_TAC THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN CONV_TAC WORD_BLAST;
+      ALL_TAC] THEN
+    FIRST_X_ASSUM(fun th -> if concl th = concl(!z2ref) then ALL_TAC
+                            else failwith "drop old z2") THEN
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [15] THEN
+    
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
 
     (* Simplify, same as CORRECT *)
     RULE_ASSUM_TAC(REWRITE_RULE[lemma2]) THEN
@@ -1458,13 +1980,55 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
      `(x:num->int16) j =
       word_zx(word_subword (q0:int128) (12 * j,12):12 word)` THEN
     FIRST_ASSUM(fun th ->
+      xref := th;
       MP_TAC(end_itlist CONJ (map (C SPEC th o mk_small_numeral) (0--7)))) THEN
     CONV_TAC(LAND_CONV NUM_REDUCE_CONV) THEN
     DISCH_THEN(fun th -> RULE_ASSUM_TAC(REWRITE_RULE[th])) THEN
 
     (* Establish table index bound for memory safety *)
+    
     SUBGOAL_THEN `val(idx:int64) < 256` ASSUME_TAC THENL
      [EXPAND_TAC "idx" THEN
+      (* Drop the `idx`/`tab` abbreviation hyps so the ASM_REWRITE below does not
+         re-fold the just-expanded mask back into `idx` (mirrors the big close's
+         2150-2153).  Without this the goal collapses to `val idx < 256` and the
+         case split leaks all 256 branches. *)
+      REPEAT(FIRST_X_ASSUM(fun th ->
+        if is_eq(concl th) && is_var(rhs(concl th)) &&
+           (let n = fst(dest_var(rhs(concl th))) in n = "tab" || n = "idx")
+        then ALL_TAC else failwith "keep")) THEN
+      (* Under ZMM the mask still references the raw pshufb controls (read
+         ZMM4 s2 / ZMM5 s6), the compare constant (read ZMM0 s7) and the byte
+         shuffle -- exactly like the big table-selection close.  Bridge those
+         ZMM reads to their low-256 (YMM) constants and fold the mask to
+         `val(x k) < 3329` form before the case split (mirrors 2129-2242). *)
+      SUBGOAL_THEN `?hi4:int256. read ZMM4 s2:(512)word = word_join hi4 (read YMM4 s2)`
+        (X_CHOOSE_THEN `hi4:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN `?hi5:int256. read ZMM5 s6:(512)word = word_join hi5 (read YMM5 s6)`
+        (X_CHOOSE_THEN `hi5:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN `?hi0:int256. read ZMM0 s7:(512)word = word_join hi0 (read YMM0 s7)`
+        (X_CHOOSE_THEN `hi0:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM0 s7:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM0; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      ASM_REWRITE_TAC[] THEN
+      CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN
+      REWRITE_TAC[lemma1b] THEN REWRITE_TAC[lemma1a] THEN REWRITE_TAC[lemma3] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_and ((word_zx:12 word->int16) x) (word 4095) = word_zx x`] THEN
+      REWRITE_TAC[COLLAPSE_ZX96] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_igt (word 3329:int16) (word_zx(x:12 word)) <=>
+        val(word_zx x:int16) < 3329`] THEN
+      W(fun _ -> REWRITE_TAC(map
+         (CONV_RULE(ONCE_DEPTH_CONV NUM_MULT_CONV) o C SPEC (!xref) o
+          mk_small_numeral) (0--7))) THEN
+      
       REWRITE_TAC[bitval] THEN
       MAP_EVERY ASM_CASES_TAC
        [`val(x 0:int16) < 3329`; `val(x 1:int16) < 3329`;
@@ -1472,11 +2036,13 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
         `val(x 4:int16) < 3329`; `val(x 5:int16) < 3329`;
         `val(x 6:int16) < 3329`; `val(x 7:int16) < 3329`] THEN
       ASM_REWRITE_TAC[bitval] THEN
+      
       CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
       CONV_TAC NUM_REDUCE_CONV;
       ALL_TAC] THEN
 
     (* Relate x(j) to SUB_LIST, same as CORRECT *)
+    
     SUBGOAL_THEN
      `!j. j < 8
           ==> (word_zx:12 word->int16)
@@ -1524,14 +2090,32 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
 
     (* Table-based selection brute force, same as CORRECT *)
     SUBGOAL_THEN
-     `read YMM2 s15 =
-      (word_join:int128->int128->int256)
-      (word_subword (ymm2_init:int256) (128,128))
-      (word(num_of_wordlist
-         (FILTER (\x. val x < 3329)
-                 [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7])))`
+     `read ZMM2 s15 =
+      (word_join:int256->int256->(512)word)
+       (word_subword (zmm2_init:(512)word) (256,256))
+       ((word_join:int128->int128->int256)
+        (word_subword (zmm2_init:(512)word) (128,128))
+        (word(num_of_wordlist
+           (FILTER (\x. val x < 3329)
+                   [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7]))))`
     MP_TAC THENL
-     [UNDISCH_TAC
+     [SUBGOAL_THEN
+        `?hi4:int256. read ZMM4 s2:(512)word = word_join hi4 (read YMM4 s2)`
+        (X_CHOOSE_THEN `hi4:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN
+        `?hi5:int256. read ZMM5 s6:(512)word = word_join hi5 (read YMM5 s6)`
+        (X_CHOOSE_THEN `hi5:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN
+        `?hi0:int256. read ZMM0 s7:(512)word = word_join hi0 (read YMM0 s7)`
+        (X_CHOOSE_THEN `hi0:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM0 s7:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM0; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      REWRITE_TAC[YMM2; READ_ZEROTOP_256] THEN
+      UNDISCH_TAC
        `read(memory :> bytes(table,4096)) s15 =
         num_of_wordlist mlkem_rej_uniform_table` THEN
       REPLICATE_TAC 4
@@ -1542,13 +2126,75 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
       CONV_TAC(LAND_CONV BYTES_EQ_NUM_OF_WORDLIST_EXPAND_CONV) THEN
       REWRITE_TAC[GSYM BYTES128_WBYTES] THEN REPEAT STRIP_TAC THEN
       ASM_REWRITE_TAC[] THEN
+      W(fun _ -> ASSUME_TAC(!idxref)) THEN
+      (* read ZMM2 s15's gather (carrying `tab` and the mask) is already in the
+         goal (ASM_REWRITE above the bridges).  Expand `tab`/`idx` to expose the
+         table read and the mask. *)
       MAP_EVERY EXPAND_TAC ["tab"; "idx"] THEN
+      (* Drop the `tab` and `idx` abbreviation hyps (`read(..table..) = tab`,
+         `<mask> = idx`).  Both are still symbolic pre-case-split, so a
+         subsequent ASM_REWRITE would otherwise re-fold the expanded terms back
+         into `tab`/`idx` (undoing the EXPAND above). *)
+      REPEAT(FIRST_X_ASSUM(fun th ->
+        if is_eq(concl th) && is_var(rhs(concl th)) &&
+           (let n = fst(dest_var(rhs(concl th))) in n = "tab" || n = "idx")
+        then ALL_TAC else failwith "keep")) THEN
+      (* Drop the x-abbreviation assumption (`!j. word_zx(word_subword q0 (12j,12))
+         = x j`) so the resolve ASM_REWRITE below does NOT fold some word_zx
+         coefficients to `x` -- that would leave the LHS in a mixed x / word_zx
+         form the word_zx case split cannot concretize.  Everything stays word_zx;
+         the RHS is unfolded to word_zx via the !xref ref (not this assumption). *)
+      W(fun _ -> FIRST_X_ASSUM(fun th ->
+        if concl th = concl(!xref) then ALL_TAC else failwith "keep")) THEN
+      (* Resolve the pshufb controls (ZMM4/ZMM5/ZMM0 -> constants via the hi4/
+         hi5/hi0 bridges + loop-invariant XMM constants) and evaluate the byte
+         shuffle so the rejection mask becomes a byte-join over q0 (the same
+         recipe the unpack fold uses for the data-path controls). *)
+      ASM_REWRITE_TAC[] THEN
+      CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN
+      (* Fold the mask's 12-bit coeff extractions to `x k` and the comparison to
+         `val(x k) < 3329`.  lemma1b first, so the word_ushr(word_join ..) forms
+         (odd coeffs) are consumed before lemma1a rewrites their inner joins;
+         then COLLAPSE_ZX96 strips the word_zx(word_subword q0 (0,96)) wrapper.
+         This is the ZMM-view analogue of what YMM view folds during stepping;
+         with the mask in x-form the val(x k)<3329 case split below concretizes
+         the gather index (the table memory read is then a concrete constant). *)
+      REWRITE_TAC[lemma1b] THEN REWRITE_TAC[lemma1a] THEN
+      REWRITE_TAC[lemma3] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_and ((word_zx:12 word->int16) x) (word 4095) = word_zx x`] THEN
+      REWRITE_TAC[COLLAPSE_ZX96] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_igt (word 3329:int16) (word_zx(x:12 word)) <=>
+        val(word_zx x:int16) < 3329`] THEN
+      (* Both the (huge) LHS gather and the mask are now in
+         `word_zx(word_subword q0 (12k,12))` form, while the RHS FILTER still uses
+         the abbreviation `x k`.  Unfold `x k -> word_zx(word_subword q0 (12k,12))`
+         in the RHS ONLY (RAND_CONV cannot reach the LHS, so the rewriter never
+         traverses/rewrites the huge term -> no stack overflow).  Now every
+         coefficient is in one form and the word_zx case split below decides
+         both the gather index and the FILTER. *)
+      
+      (* Flip xref (`!j. word_zx(word_subword q0 (12j,12)) = x j`) to unfold
+         `x j`, quantifying ONLY j so x and q0 stay fixed.  (Plain GSYM would
+         GEN_ALL x and q0 too, making `x j` a schematic pattern that matches any
+         application and diverges.) *)
+      W(fun _ -> CONV_TAC(RAND_CONV(
+         REWRITE_CONV[GEN `j:num` (SYM(SPEC `j:num` (!xref)))] THENC
+         ONCE_DEPTH_CONV NUM_MULT_CONV))) THEN
+      
       REWRITE_TAC[bitval] THEN
       MAP_EVERY ASM_CASES_TAC
-       [`val(x 0:int16) < 3329`; `val(x 1:int16) < 3329`;
-        `val(x 2:int16) < 3329`; `val(x 3:int16) < 3329`;
-        `val(x 4:int16) < 3329`; `val(x 5:int16) < 3329`;
-        `val(x 6:int16) < 3329`; `val(x 7:int16) < 3329`] THEN
+       [`val(word_zx(word_subword (q0:int128) (0,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (12,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (24,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (36,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (48,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (60,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (72,12):12 word):int16) < 3329`;
+        `val(word_zx(word_subword (q0:int128) (84,12):12 word):int16) < 3329`] THEN
       ASM_REWRITE_TAC[FILTER] THEN
       CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
       ASM_REWRITE_TAC[WORD_ADD_0] THEN
@@ -1556,12 +2202,27 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
       CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
       REPLICATE_TAC 3 (ONCE_REWRITE_TAC[GSYM NUM_OF_PAIR_WORDLIST]) THEN
       REWRITE_TAC[pair_wordlist; NUM_OF_WORDLIST_SING; WORD_VAL] THEN
-      REWRITE_TAC[num_of_wordlist] THEN CONV_TAC WORD_BLAST;
-      DISCARD_MATCHING_ASSUMPTIONS [`read YMM2 s = x`] THEN STRIP_TAC] THEN
+      REWRITE_TAC[num_of_wordlist] THEN
+      (* Per branch the mask is now concrete, so the residual is small.  The
+         gather DATA on the LHS is in `x k` form (folded at the loop body) while
+         the RHS/filter is in `word_zx(word_subword q0 (12k,12))` form; fold the
+         latter back to `x k` (safe: word_zx pattern on the LHS of the rule, and
+         the term is small post-split so no stack blow-up) so both sides match. *)
+      W(fun _ -> REWRITE_TAC(map
+         (CONV_RULE(ONCE_DEPTH_CONV NUM_MULT_CONV) o C SPEC (!xref) o
+          mk_small_numeral) (0--7))) THEN
+      CONV_TAC WORD_BLAST;
+      DISCARD_MATCHING_ASSUMPTIONS [`read ZMM2 s = x`; `read YMM2 s = x`] THEN
+      STRIP_TAC] THEN
 
     (* Writeback and popcount, same as CORRECT *)
     VAL_INT64_TAC `curlen:num` THEN
-    X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (16--17) THEN
+    ABBREV_TAC `q2 = read ZMM2 s15` THEN
+    (* ZMM: step the popcnt with VSTEPS+RESUGAR+SIMPLIFY (not X86_STEPS) so the
+       SIMD-derived `read R11 s17` survives DISCARD_OLDSTATE, mirroring CORRECT. *)
+    X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (16--17) THEN
+    X86_YMM_RESUGAR_TAC THEN
+    ZMM_SIMD_SIMPLIFY_TAC THEN
     RULE_ASSUM_TAC(CONV_RULE(TOP_DEPTH_CONV (WORD_SIMPLE_SUBWORD_CONV))) THEN
 
     (* Counting, same as CORRECT *)
@@ -1569,28 +2230,71 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
      `read R11 s17 = word(LENGTH (FILTER (\x. val x < 3329)
                        [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7]))`
     MP_TAC THENL
-     [ASM_REWRITE_TAC[] THEN
+     [
+      ASM_REWRITE_TAC[] THEN
+      
       FIRST_X_ASSUM(fun th ->
         GEN_REWRITE_TAC (LAND_CONV o RAND_CONV o RAND_CONV) [SYM th]) THEN
+      
+      (* ZMM view: the popcount's mask `idx` is the same raw word_condense over
+         word_zx pshufb coefficients as in the table-selection subgoal.  Resolve
+         the pshufb controls (ZMM4/ZMM5/ZMM0 bridges) and fold the 12-bit coeff
+         extractions to `x k` so the val(x k)<3329 COND_CASES below reduces the
+         popcount (this goal is small, so folding word_zx->x on the whole goal
+         does not blow the rewriter stack). *)
+      SUBGOAL_THEN `?hi4:int256. read ZMM4 s2:(512)word = word_join hi4 (read YMM4 s2)`
+        (X_CHOOSE_THEN `hi4:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM4 s2:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM4; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN `?hi5:int256. read ZMM5 s6:(512)word = word_join hi5 (read YMM5 s6)`
+        (X_CHOOSE_THEN `hi5:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM5 s6:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM5; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      SUBGOAL_THEN `?hi0:int256. read ZMM0 s7:(512)word = word_join hi0 (read YMM0 s7)`
+        (X_CHOOSE_THEN `hi0:int256` ASSUME_TAC) THENL
+       [EXISTS_TAC `word_subword (read ZMM0 s7:(512)word) (256,256):int256` THEN
+        REWRITE_TAC[YMM0; READ_ZEROTOP_256] THEN CONV_TAC WORD_BLAST; ALL_TAC] THEN
+      ASM_REWRITE_TAC[] THEN
+      CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
+      CONV_TAC(TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+      CONV_TAC(DEPTH_CONV WORD_NUM_RED_CONV) THEN
+      REWRITE_TAC[lemma1b] THEN REWRITE_TAC[lemma1a] THEN
+      REWRITE_TAC[lemma3] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_and ((word_zx:12 word->int16) x) (word 4095) = word_zx x`] THEN
+      REWRITE_TAC[COLLAPSE_ZX96] THEN
+      REWRITE_TAC[BITBLAST_RULE
+       `word_igt (word 3329:int16) (word_zx(x:12 word)) <=>
+        val(word_zx x:int16) < 3329`] THEN
+      
+      W(fun _ -> REWRITE_TAC(map
+         (CONV_RULE(ONCE_DEPTH_CONV NUM_MULT_CONV) o C SPEC (!xref) o
+          mk_small_numeral) (0--7))) THEN
+      
       REPEAT(ONCE_REWRITE_TAC[FILTER] THEN REWRITE_TAC[] THEN
              COND_CASES_TAC THEN ASM_REWRITE_TAC[]) THEN
-      DISCARD_STATE_TAC "s17" THEN REWRITE_TAC[BITVAL_CLAUSES] THEN
+      
+      TRY(DISCARD_STATE_TAC "s17") THEN REWRITE_TAC[BITVAL_CLAUSES] THEN
       CONV_TAC(DEPTH_CONV(WORD_NUM_RED_CONV ORELSEC WORD_CONDENSE_CONV)) THEN
       REWRITE_TAC[LENGTH; FILTER] THEN CONV_TAC NUM_REDUCE_CONV THEN REFL_TAC;
       DISCARD_MATCHING_ASSUMPTIONS [`read R11 s = x`] THEN STRIP_TAC] THEN
+    
 
     (* Overlapping writebacks, same as CORRECT *)
     MAP_EVERY ABBREV_TAC
      [`lis = FILTER (\x. val x < 3329)
                     [x 0:int16; x 1; x 2; x 3; x 4; x 5; x 6; x 7]`;
       `len = LENGTH(lis:int16 list)`] THEN
+    
 
     SUBGOAL_THEN `len <= 8` ASSUME_TAC THENL
      [MAP_EVERY EXPAND_TAC ["len"; "lis"] THEN
+      
       REPEAT CONJ_TAC THEN
       W(MP_TAC o PART_MATCH lhand LENGTH_FILTER o lhand o snd) THEN
       REWRITE_TAC[LENGTH] THEN ARITH_TAC;
       ALL_TAC] THEN
+    
 
     ABBREV_TAC `curlist':int16 list = APPEND curlist lis` THEN
     ABBREV_TAC `curlen':num = curlen + len` THEN
@@ -1623,12 +2327,15 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
       ASM_REWRITE_TAC[DIMINDEX_16] THEN
       UNDISCH_TAC `len <= 8` THEN ARITH_TAC;
       ALL_TAC] THEN
+    
 
+    
     SUBGOAL_THEN `LENGTH(curlist':int16 list) = curlen'` ASSUME_TAC THENL
      [MAP_EVERY EXPAND_TAC ["curlist'"; "curlen'"] THEN
       REWRITE_TAC[LENGTH_APPEND] THEN ASM_REWRITE_TAC[];
       ALL_TAC] THEN
 
+    
     SUBGOAL_THEN `REJ_SAMPLE (SUB_LIST(8 * i,8) inlist) = lis` ASSUME_TAC THENL
      [EXPAND_TAC "lis" THEN REWRITE_TAC[REJ_SAMPLE] THEN AP_TERM_TAC THEN
       REWRITE_TAC[LIST_EQ] THEN CONV_TAC(ONCE_DEPTH_CONV LENGTH_CONV) THEN
@@ -1650,20 +2357,30 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
       ALL_TAC] THEN
 
     (* Case split over ending loop count, same structure as CORRECT *)
+    
     COND_CASES_TAC THEN ASM_REWRITE_TAC[] THENL
      [(* Case i + 1 < N: loop continues *)
+      
       FIRST_X_ASSUM(MP_TAC o C MATCH_MP (ASSUME `i + 1 < N`)) THEN
       ASM_REWRITE_TAC[NOT_LT; ARITH_RULE `(i + 1) + 1 = i + 2`] THEN
       STRIP_TAC THEN VAL_INT64_TAC `curlen':num` THEN
-      X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (18--20) THEN
-      (* Memsafe: protect events from GSYM WORD_ADD rewriting *)
-      POP_ASSUM(fun ev_th ->
-        POP_ASSUM MP_TAC THEN
-        ASM_REWRITE_TAC[GSYM WORD_ADD; GSYM NOT_LT] THEN
-        DISCH_TAC THEN
-        ASSUME_TAC ev_th) THEN
-      X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (21--23) THEN
-      ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN CONJ_TAC THENL
+      X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (18--20) THEN
+      
+      (* Resolve the JAE's conditional RIP: find `read RIP sN = if ..` by shape
+         (VSTEPS keeps many assumptions, so it isn't reliably on top). *)
+      FIRST_X_ASSUM(fun rth ->
+        if is_eq(concl rth) &&
+           dcontains (string_of_term (lhs (concl rth))) "read RIP" &&
+           is_cond (rhs (concl rth))
+        then MP_TAC rth else failwith "not the conditional RIP") THEN
+      ASM_REWRITE_TAC[GSYM WORD_ADD; GSYM NOT_LT] THEN DISCH_TAC THEN
+      
+      X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (21--23) THEN
+      DISCARD_OLDSTATE_KEEP_EVENTS_TAC "s23" THEN
+      
+      ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
+      
+      CONJ_TAC THENL
        [MATCH_MP_TAC(TAUT `p ==> (if p then x else y) = x`) THEN
         ASM_REWRITE_TAC[VAL_EQ_0; WORD_SUB_EQ_0; NOT_LT; DE_MORGAN_THM] THEN
         REWRITE_TAC[WORD_RULE
@@ -1673,6 +2390,7 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
         ASM_REWRITE_TAC[GSYM VAL_EQ] THEN
         UNDISCH_TAC `12 * (i + 2) <= buflen` THEN ARITH_TAC;
         ALL_TAC] THEN
+      
       ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
       REPLICATE_TAC 3 (CONJ_TAC THENL [CONV_TAC WORD_BLAST; ALL_TAC]) THEN
       CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
@@ -1680,17 +2398,24 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
       CONJ_TAC THENL [CONV_TAC WORD_RULE; ALL_TAC] THEN
       RULE_ASSUM_TAC(REWRITE_RULE[WORD_ADD]) THEN
       EXPAND_TAC "cur" THEN
+      
       DISCHARGE_MEMSAFE_ASM_TAC;
 
       (* Case i + 1 >= N: loop might exit *)
-      X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (18--20) THEN
-      (* Memsafe: protect events from GSYM WORD_ADD rewriting *)
-      POP_ASSUM(fun ev_th ->
-        POP_ASSUM MP_TAC THEN
-        ASM_REWRITE_TAC[GSYM WORD_ADD; GSYM NOT_LT] THEN
-        VAL_INT64_TAC `curlen':num` THEN ASM_REWRITE_TAC[NOT_LT] THEN
-        COND_CASES_TAC THEN DISCH_TAC THEN
-        ASSUME_TAC ev_th) THENL
+      
+      X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (18--20) THEN
+      
+      (* Resolve the JAE conditional RIP by shape, then case-split on the count
+         (JAE taken = exit; not taken = fall through).  Keep the events chain. *)
+      FIRST_X_ASSUM(fun rth ->
+        if is_eq(concl rth) &&
+           dcontains (string_of_term (lhs (concl rth))) "read RIP" &&
+           is_cond (rhs (concl rth))
+        then MP_TAC rth else failwith "not the conditional RIP") THEN
+      ASM_REWRITE_TAC[GSYM WORD_ADD; GSYM NOT_LT] THEN
+      VAL_INT64_TAC `curlen':num` THEN ASM_REWRITE_TAC[NOT_LT] THEN
+      COND_CASES_TAC THEN DISCH_TAC THEN
+      DISCARD_OLDSTATE_KEEP_EVENTS_TAC "s20" THENL
        [(* Exit via JAE (outlen >= 256) *)
         ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
         ASM_REWRITE_TAC[XMM0; XMM4; XMM5; READ_ZEROTOP_128] THEN
@@ -1703,7 +2428,8 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
         DISCHARGE_MEMSAFE_ASM_TAC;
 
         (* Fall through to buffer exhaustion exit *)
-        X86_STEPS_TAC MLKEM_REJ_UNIFORM_EXEC (21--23) THEN
+        X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC (21--23) THEN
+        DISCARD_OLDSTATE_KEEP_EVENTS_TAC "s23" THEN
         ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN CONJ_TAC THENL
          [MATCH_MP_TAC(TAUT `p ==> (if ~p then x else y) = y`) THEN
           ASM_REWRITE_TAC[VAL_EQ_0; WORD_SUB_EQ_0; NOT_LT; DE_MORGAN_THM] THEN
@@ -1774,9 +2500,12 @@ let MLKEM_REJ_UNIFORM_MEMSAFE = prove
     RULE_ASSUM_TAC(REWRITE_RULE[WORD_RULE
      `word_shl (word n) 1 = word(2 * n)`]) THEN
     VAL_INT64_TAC `2 * MIN 256 outlen` THEN
+    
     X86_VSTEPS_TAC MLKEM_REJ_UNIFORM_EXEC [7] THEN
+    
     FIRST_X_ASSUM(MP_TAC o check
       (can (term_match [] `z = read c (write c y s)`) o concl)) THEN
+    
     SIMP_TAC[READ_WRITE_X86_STRINGCOPY; ARITH_RULE
         `2 * MIN 256 l < 2 EXP 64`] THEN
     W(MP_TAC o PART_MATCH (lhand o rand) X86_STRINGCOPY_NONOVERLAPPING o
