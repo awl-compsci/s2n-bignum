@@ -880,14 +880,14 @@ let ROUND_CORRECT = prove
        (MAYCHANGE [RIP; R11] ,,
         MAYCHANGE [ZMM0; ZMM1; ZMM2; ZMM3; ZMM4; ZMM5; ZMM6; ZMM7; ZMM8; ZMM9; ZMM10; ZMM11; ZMM12; ZMM13; ZMM14; ZMM15; ZMM16; ZMM17; ZMM18; ZMM19; ZMM20; ZMM21; ZMM22; ZMM23; ZMM24; ZMM25; ZMM26; ZMM27; ZMM28; ZMM29; ZMM30; ZMM31] ,,
         MAYCHANGE SOME_FLAGS ,, MAYCHANGE [events])`,
-  REWRITE_TAC[SOME_FLAGS; fst SHA3_KECCAK4_F1600_AVX512VL_EXEC; keccak4_pack] THEN
+  REWRITE_TAC[SOME_FLAGS; fst SHA3_KECCAK4_F1600_AVX512VL_EXEC] THEN
   MAP_EVERY X_GEN_TAC
    [`pc:num`; `rcptr:int64`; `rc:int64`;
     `B1:int64 list`; `B2:int64 list`; `B3:int64 list`; `B4:int64 list`;
     `d:int64`; `rp:int64`; `cnt:int64`] THEN
   REWRITE_TAC[LENGTH_EQ_25] THEN
   DISCH_THEN(REPEAT_TCL CONJUNCTS_THEN SUBST1_TAC) THEN
-  REWRITE_TAC[MAP2; CONS_11] THEN
+  (* packing expansion DEFERRED to discharge (keep lanes folded/opaque) *)
   (* unfold the rc-table wordlist (pre+post) into 24 component 64-bit reads so
      they are frame-preserved single reads, closed by ASM_REWRITE after stepping *)
   REWRITE_TAC[round_constants] THEN
@@ -922,14 +922,24 @@ let ROUND_CORRECT = prove
   GHOST_INTRO_TAC `zg23:(512)word` `read ZMM23` THEN
   GHOST_INTRO_TAC `zg24:(512)word` `read ZMM24` THEN
   ENSURES_INIT_TAC "s0" THEN
-  MAP_EVERY (fun n -> X86_STEPS_TAC SHA3_KECCAK4_F1600_AVX512VL_EXEC [n] THEN
-                      ZXCOLLAPSE_TAC) (1--142) THEN
+  MAP_EVERY (fun n -> X86_STEPS_TAC SHA3_KECCAK4_F1600_AVX512VL_EXEC [n] THEN ZXCOLLAPSE_TAC) (1--142) THEN
   ENSURES_FINAL_STATE_TAC THEN
   REWRITE_TAC[YMM0; YMM1; YMM2; YMM3; YMM4; YMM5; YMM6; YMM7; YMM8; YMM9;
               YMM10; YMM11; YMM12; YMM13; YMM14; YMM15; YMM16; YMM17; YMM18;
               YMM19; YMM20; YMM21; YMM22; YMM23; YMM24; READ_ZEROTOP_256] THEN
   ASM_REWRITE_TAC[] THEN
-  REWRITE_TAC[keccak_round] THEN
+  (* packing was deferred: expand the folded precondition packing hyp into per-lane
+     equalities (word_zx zg_k = word_join(EL k ...)) so per-bit BITBLAST can relate
+     the opaque stepped lanes to B; keep lanes opaque (no substitution -> no re-bloat) *)
+  (* deferred packing: split the folded precondition packing into per-lane hyps
+     (word_zx zg_k = word_join(EL k B4)(EL k B3)(EL k B2)(EL k B1)), then SUBSTITUTE
+     into the goal to make each lane self-contained in EL B, so LANE_TAC applies. *)
+  RULE_ASSUM_TAC(REWRITE_RULE[keccak4_pack; MAP2; CONS_11]) THEN
+  REPEAT(FIRST_X_ASSUM(CONJUNCTS_THEN ASSUME_TAC o check(is_conj o concl))) THEN
+  (* substitute the packing (word_zx zg_k -> word_join(EL k B..)) -> goal now concrete
+     in EL B, no zg; then the canonical LANE_TAC discharge applies. *)
+  ASM_REWRITE_TAC[] THEN
+  REWRITE_TAC[keccak4_pack; keccak_round] THEN
   CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
   REWRITE_TAC[MAP2; CONS_11] THEN
   CONV_TAC(DEPTH_CONV EL_CONV) THEN
