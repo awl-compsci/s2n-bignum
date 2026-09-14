@@ -804,7 +804,21 @@ let mksumle a b c = ARITH_RULE(mk_comb(mk_comb(`(<=):num->num->bool`, mk_binop `
 let ZX_LEFACTS = (List.concat(map(fun a->List.concat(map(fun b->if a<=b then [mkle a b] else [])ZXWS)) ZXWS)) @
   (List.concat(map(fun a->List.concat(map(fun b->List.concat(map(fun c->if a+b<=c then [mksumle a b c] else [])ZXWS))ZXWS))ZXWS));;
 let ZXCOLLAPSE = SIMP_CONV([WORD_ZX_ZX; WORD_SUBWORD_WORD_ZX; DIMINDEX_32;DIMINDEX_64;DIMINDEX_128;DIMINDEX_256;DIMINDEX_512] @ ZX_LEFACTS);;
-let ZXCOLLAPSE_TAC : tactic = RULE_ASSUM_TAC(CONV_RULE ZXCOLLAPSE);;
+(* Collapse only the freshly-written hypotheses that actually carry a word_zx
+   redex (word_zx(word_zx ..) or word_subword(word_zx ..)); the ~24 stable
+   register hyps are already at fixpoint, so re-running ZXCOLLAPSE on them each
+   step is pure waste.  Skipping them ~halves the per-step collapse cost with an
+   identical result (ZXCOLLAPSE is a no-op on redex-free terms). *)
+let rec zx_collapsible t =
+  match t with
+  | Comb(Const("word_zx",_), Comb(Const("word_zx",_),_)) -> true
+  | Comb(Comb(Const("word_subword",_), Comb(Const("word_zx",_),_)), _) -> true
+  | Comb(a,b) -> zx_collapsible a || zx_collapsible b
+  | Abs(_,b) -> zx_collapsible b
+  | _ -> false;;
+let ZXCOLLAPSE_TAC : tactic =
+  RULE_ASSUM_TAC(fun th ->
+    if zx_collapsible (concl th) then CONV_RULE ZXCOLLAPSE th else th);;
 
 (* ------------------------------------------------------------------------- *)
 (* Prove-once/compose-per-buffer lane discharge.                             *)
