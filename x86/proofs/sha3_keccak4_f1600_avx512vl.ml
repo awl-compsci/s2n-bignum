@@ -789,6 +789,58 @@ let INT256_EQ_LANES = prove
     BITBLAST_TAC]);;
 
 (* ------------------------------------------------------------------------- *)
+(* Per-step word_zx round-trip collapse (keeps ZMM-view stepped terms clean  *)
+(* so the discharge goals stay small and structurally lane-aligned).         *)
+let WORD_SUBWORD_WORD_ZX = prove
+ (`!(x:N word) pos len. pos + len <= dimindex(:N) /\ dimindex(:N) <= dimindex(:M)
+      ==> word_subword ((word_zx x):M word) (pos,len):P word = word_subword x (pos,len)`,
+  REPEAT STRIP_TAC THEN REWRITE_TAC[WORD_EQ_BITS_ALT; BIT_WORD_SUBWORD; BIT_WORD_ZX] THEN
+  GEN_TAC THEN DISCH_TAC THEN
+  MATCH_MP_TAC(TAUT `(a ==> c) ==> (a /\ (c /\ d) <=> a /\ d)`) THEN
+  REWRITE_TAC[ARITH_RULE `i < MIN a b <=> i < a /\ i < b`] THEN ASM_ARITH_TAC);;
+let ZXWS = [0;32;64;96;128;160;192;224;256;320;384;448;512];;
+let mkle a b = ARITH_RULE(mk_comb(mk_comb(`(<=):num->num->bool`, mk_small_numeral a), mk_small_numeral b));;
+let mksumle a b c = ARITH_RULE(mk_comb(mk_comb(`(<=):num->num->bool`, mk_binop `(+):num->num->num` (mk_small_numeral a)(mk_small_numeral b)), mk_small_numeral c));;
+let ZX_LEFACTS = (List.concat(map(fun a->List.concat(map(fun b->if a<=b then [mkle a b] else [])ZXWS)) ZXWS)) @
+  (List.concat(map(fun a->List.concat(map(fun b->List.concat(map(fun c->if a+b<=c then [mksumle a b c] else [])ZXWS))ZXWS))ZXWS));;
+let ZXCOLLAPSE = SIMP_CONV([WORD_ZX_ZX; WORD_SUBWORD_WORD_ZX; DIMINDEX_32;DIMINDEX_64;DIMINDEX_128;DIMINDEX_256;DIMINDEX_512] @ ZX_LEFACTS);;
+let ZXCOLLAPSE_TAC : tactic = RULE_ASSUM_TAC(CONV_RULE ZXCOLLAPSE);;
+
+(* ------------------------------------------------------------------------- *)
+(* Prove-once/compose-per-buffer lane discharge.                             *)
+(* A round output int256 register holds the SAME keccak_round lane computed  *)
+(* on 4 independent buffers B1..B4 (positions 0/64/128/192 of the packed     *)
+(* word_join).  Splitting into the 4 int64 sublanes and pushing word_subword *)
+(* inward (through and/or/xor/not/join/zx) isolates ONE buffer per sublane   *)
+(* (~1600 free bits vs ~6400), and the 4 sublanes are buffer-renamings of    *)
+(* each other -> BITBLAST the first, INST the rest for free (~10x/lane).      *)
+let SWP : conv =
+  let aox = GEN_REWRITE_CONV I [WORD_SUBWORD_AND; WORD_SUBWORD_OR; WORD_SUBWORD_XOR] in
+  let notm = PART_MATCH (lhs o rand) WORD_SUBWORD_NOT in
+  let dis = (REWRITE_CONV[DIMINDEX_64;DIMINDEX_128;DIMINDEX_256] THENC NUM_REDUCE_CONV) in
+  let push1 t =
+    (try WORD_SIMPLE_SUBWORD_CONV t with Failure _ ->
+     try aox t with Failure _ ->
+     let th = notm t in MP th (EQT_ELIM(dis (lhand(concl th))))) in
+  TOP_DEPTH_CONV push1;;
+
+let LANE_TAC : tactic =
+  let islist v = match type_of v with Tyapp("list",_)->true | _->false in
+  ONCE_REWRITE_TAC[INT256_EQ_LANES] THEN
+  CONV_TAC SWP THEN
+  W(fun (_,w) ->
+     let cs = conjuncts w in
+     let g0 = hd cs in
+     let b0 = find islist (frees g0) in
+     let th0 = prove(g0, BITBLAST_TAC) in
+     let thms = map (fun g ->
+        if g = g0 then th0
+        else let bg = find islist (frees g) in
+             let th = INST [bg,b0] th0 in
+             EQ_MP (ALPHA (concl th) g) th) cs in
+     ACCEPT_TAC(end_itlist CONJ thms));;
+
+(* ------------------------------------------------------------------------- *)
 (* M1 round-body correctness (STRONG: carries RDI/RSI/R10/rc-table wordlist  *)
 (* and bytes_loaded through pre+post, needed by the loop invariant).         *)
 (* ------------------------------------------------------------------------- *)
@@ -856,7 +908,8 @@ let ROUND_CORRECT = prove
   GHOST_INTRO_TAC `zg23:(512)word` `read ZMM23` THEN
   GHOST_INTRO_TAC `zg24:(512)word` `read ZMM24` THEN
   ENSURES_INIT_TAC "s0" THEN
-  X86_STEPS_TAC SHA3_KECCAK4_F1600_AVX512VL_EXEC (1--142) THEN
+  MAP_EVERY (fun n -> X86_STEPS_TAC SHA3_KECCAK4_F1600_AVX512VL_EXEC [n] THEN
+                      ZXCOLLAPSE_TAC) (1--142) THEN
   ENSURES_FINAL_STATE_TAC THEN
   REWRITE_TAC[YMM0; YMM1; YMM2; YMM3; YMM4; YMM5; YMM6; YMM7; YMM8; YMM9;
               YMM10; YMM11; YMM12; YMM13; YMM14; YMM15; YMM16; YMM17; YMM18;
@@ -866,8 +919,7 @@ let ROUND_CORRECT = prove
   CONV_TAC(TOP_DEPTH_CONV let_CONV) THEN
   REWRITE_TAC[MAP2; CONS_11] THEN
   CONV_TAC(DEPTH_CONV EL_CONV) THEN
-  REPEAT CONJ_TAC THEN
-  W(fun (_,w) -> ACCEPT_TAC(prove(w, BITBLAST_TAC))));;
+  REPEAT CONJ_TAC THEN LANE_TAC);;
 
 (* Element i (i<24) of the round-constants wordlist in memory = EL i round_constants *)
 let RC_AT_R11 = prove
