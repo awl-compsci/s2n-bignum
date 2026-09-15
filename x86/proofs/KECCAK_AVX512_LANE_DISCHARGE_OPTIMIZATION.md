@@ -1,10 +1,18 @@
 # AVX-512VL 4× Keccak-f1600 proof: `LANE_TAC` discharge optimization
 
 **TL;DR** — The HOL Light proof of `sha3_keccak4_f1600_avx512vl` was cut from
-**3h22m to 60.5min (≈3.3×)**, kernel-clean, all four ABI specs, pure ZMM operand
-view. The win comes from a new lane-discharge tactic (`LANE_TAC`) plus per-step
-`word_zx` collapse during stepping. Both live in
-`x86/proofs/sha3_keccak4_f1600_avx512vl.ml`.
+**3h22m to 24.6min (≈8.2×)**, kernel-clean, all four ABI specs, pure ZMM operand
+view, in three layered steps (all in `x86/proofs/sha3_keccak4_f1600_avx512vl.ml`):
+
+| step | time | vs baseline |
+|---|---|---|
+| baseline | 3h22m | 1× |
+| `LANE_TAC` prove-once/per-buffer discharge | 60.5min | 3.3× |
+| + redex-filtered `ZXCOLLAPSE` (§8) | 51.2min | 3.95× |
+| + deferred (opaque-lane) packing (§9) | **24.6min** | **8.2×** |
+
+The discharge win is `LANE_TAC` (§3–4); the stepping wins are redex-filtered
+per-step collapse (§8) and deferred packing (§9).
 
 ---
 
@@ -164,3 +172,38 @@ than plain stepping, but it is what keeps the discharge terms small enough for
 - The 25 output-lane functions are distinct (different ρ/π/ι), so there is no
   cross-lane blast reuse beyond the 4 buffers — 25 blasts is the floor for this
   structure.
+
+## 8. Stepping win 1 — redex-filtered `ZXCOLLAPSE` (~38 → ~30 min)
+
+Per-step cost splits ~67% `X86_STEPS` (symbolic execution) + ~33% `ZXCOLLAPSE`.
+`ZXCOLLAPSE_TAC` re-ran `SIMP_CONV` over **all ~25 ZMM register hypotheses every
+step**, but only the just-written register carries a fresh `word_zx` **redex**
+(`word_zx(word_zx …)` / `word_subword(word_zx …)`); the other ~24 are already at
+fixpoint. A plain "contains `word_zx`" filter fails — every register keeps an
+*outer* write-zerotop `word_zx`. Filtering on the actual redex (`zx_collapsible`)
+skips the fixpoint hyps, ~halving the collapse cost with an **identical** result
+(`ZXCOLLAPSE` is a no-op on redex-free terms).
+
+## 9. Stepping win 2 — deferred (opaque-lane) packing (~30 → ~8 min stepping)
+
+Expanding `keccak4_pack` *before* stepping makes each 256-bit lane a concrete
+`word_join(word_join(EL k B4)(EL k B3))(word_join(EL k B2)(EL k B1))` (7 nodes ×
+25), so the stepped terms are ~2× larger and both `X86_STEPS` and collapse are
+dear. Instead, keep the 4 buffers packed as **opaque 512-bit ghosts** (`zg_k`)
+through symbolic execution and defer the `keccak4_pack` expansion to the discharge:
+
+1. step with opaque lanes → stepping ~8 min (vs ~30);
+2. at discharge, split the precondition packing into per-lane equations
+   `word_zx zg_k = word_join(EL k B4)(EL k B3)(EL k B2)(EL k B1)`;
+3. `ASM_REWRITE` them into the goal → every `word_zx zg_k` leaf becomes concrete
+   in `EL B` (the goal is now `zg`-free, identical to the upfront-packed goal);
+4. unfold `keccak4_pack`/`keccak_round` and finish per lane with `LANE_TAC`.
+
+The old fear (deferred goals depend on the ghosts' free high-256 bits →
+12898-var non-tautology) is unfounded: the stepped values reference only the
+low-256 sublanes (`word_subword(zg_k)(off,64)`, `off∈{0,64,128,192}`), and
+`word_zx` zero-extends the high half. Two pitfalls when wiring this up: don't
+insert `word_subword`-through-truncation lemmas (they fire on 512-bit
+intermediate `word_subword`s and mangle the term), and **do** add `keccak4_pack`
+to the goal rewrite — otherwise the 25-lane list equality never splits and
+`LANE_TAC` sees the whole list at once.
