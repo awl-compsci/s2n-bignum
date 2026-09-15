@@ -149,11 +149,11 @@ All 25 lanes were independently validated via this harness before folding.
 
 ## 6. Result
 
-| | baseline | optimized |
-|---|---|---|
-| full proof (all 4 ABI specs) | 3h22m (12129 s) | **60.5 min (3631 s)** |
-| ROUND_CORRECT discharge | ~2.7 hr | ~14 min (25 × ~30-40 s) |
-| stepping | ~25 min | ~38 min (per-step ZXCOLLAPSE) |
+| | baseline | `LANE_TAC` only | + redex-DIRTY + deferred |
+|---|---|---|---|
+| full proof (all 4 ABI specs) | 3h22m (12129 s) | 60.5 min (3631 s) | **24.6 min (1477 s)** |
+| ROUND_CORRECT discharge | ~2.7 hr | ~14 min (25 × ~30-40 s) | ~14 min |
+| stepping | ~25 min | ~38 min | ~8 min (deferred, §9) |
 
 `check_axioms` clean; specs `SHA3_KECCAK4_F1600_AVX512VL_{NOIBT_SUBROUTINE,
 SUBROUTINE, NOIBT_WINDOWS_SUBROUTINE, WINDOWS_SUBROUTINE}_CORRECT` all proven;
@@ -161,9 +161,12 @@ pure ZMM operand view (no YMM).
 
 ## 7. Where the time is now, and further ideas
 
-Stepping (~38 min) is now the dominant cost — the per-step `ZXCOLLAPSE` is heavier
-than plain stepping, but it is what keeps the discharge terms small enough for
-`LANE_TAC`, so it more than pays for itself.
+After the stepping wins (§8 redex-DIRTY, §9 deferred packing), stepping is ~8 min
+and the ~14 min discharge (25 per-lane `BITBLAST`s) is again the dominant cost.
+The remaining floor: the 25 output-lane functions are distinct (different ρ/π/ι),
+so there is no cross-lane blast reuse beyond the 4 buffers — 25 blasts is intrinsic
+to this structure. (The paragraphs below were the original notes when stepping
+still dominated; §9 implements the "deferred packing" lever they anticipated.)
 
 - **Deferred (opaque-lane) stepping** runs in ~8 min but leaves the buffer packing
   in hypotheses; `LANE_TAC` needs a self-contained goal, so it would require
