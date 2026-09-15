@@ -123,8 +123,11 @@ and xmm11 = define `xmm11 = Simdreg (word 11) Lower_128`
 and xmm12 = define `xmm12 = Simdreg (word 12) Lower_128`
 and xmm13 = define `xmm13 = Simdreg (word 13) Lower_128`
 and xmm14 = define `xmm14 = Simdreg (word 14) Lower_128`
-and xmm15 = define `xmm15 = Simdreg (word 15) Lower_128`
-and xmm16 = define `xmm16 = Simdreg (word 16) Lower_128`
+and xmm15 = define `xmm15 = Simdreg (word 15) Lower_128`;;
+
+(* EVEX extends the vector file to 32 registers; xmm16-31 are the low 128 bits
+   of the corresponding zmm and require EVEX encoding. *)
+let xmm16 = define `xmm16 = Simdreg (word 16) Lower_128`
 and xmm17 = define `xmm17 = Simdreg (word 17) Lower_128`
 and xmm18 = define `xmm18 = Simdreg (word 18) Lower_128`
 and xmm19 = define `xmm19 = Simdreg (word 19) Lower_128`
@@ -156,8 +159,9 @@ and ymm11 = define `ymm11 = Simdreg (word 11) Lower_256`
 and ymm12 = define `ymm12 = Simdreg (word 12) Lower_256`
 and ymm13 = define `ymm13 = Simdreg (word 13) Lower_256`
 and ymm14 = define `ymm14 = Simdreg (word 14) Lower_256`
-and ymm15 = define `ymm15 = Simdreg (word 15) Lower_256`
-and ymm16 = define `ymm16 = Simdreg (word 16) Lower_256`
+and ymm15 = define `ymm15 = Simdreg (word 15) Lower_256`;;
+
+let ymm16 = define `ymm16 = Simdreg (word 16) Lower_256`
 and ymm17 = define `ymm17 = Simdreg (word 17) Lower_256`
 and ymm18 = define `ymm18 = Simdreg (word 18) Lower_256`
 and ymm19 = define `ymm19 = Simdreg (word 19) Lower_256`
@@ -414,6 +418,13 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | VPINSRW operand operand operand operand
    | VEXTRACTI128 operand operand operand
    | VINSERTI128 operand operand operand operand
+   // EVEX 128-bit-lane transpose ops used by the 4x multi-buffer Keccak.
+   // Modelled unmasked (the decoder rejects a mask decoration).
+   // VSHUFI64X2 dest src1 src2 imm8; VINSERTI32X4 dest src1 src2 imm8;
+   // VEXTRACTI32X4 dest src imm8.
+   | VSHUFI64X2 operand operand operand operand
+   | VINSERTI32X4 operand operand operand operand
+   | VEXTRACTI32X4 operand operand operand
    | VPABSD operand operand
    | VPACKUSWB operand operand operand
    | VPCMPGTD operand operand operand
@@ -450,9 +461,27 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | VPSUBQ operand operand operand
    | VPSUBW operand operand operand
    | VPTEST operand operand
+   | VPTERNLOGD operand operand operand operand evex_deco
+   | VPTERNLOGQ operand operand operand operand evex_deco
    | VPUNPCKHQDQ operand operand operand
    | VPUNPCKLQDQ operand operand operand
    | VPXOR operand operand operand
+   | VPXORQ operand operand operand evex_deco
+   | VPROLQ operand operand operand evex_deco
+   | VPROLVQ operand operand operand evex_deco
+   // EVEX variable-index qword permute (opcode 0F38 W1 0x36): distinct from the
+   // AVX2 imm8-controlled VPERMQ above; trailing V (cf. VPSLLD vs VPSLLVD).
+   // dest = ModRM.reg, idx = EVEX.vvvv, src = ModRM.r/m.
+   | VPERMQV operand operand operand evex_deco
+   | VPBLENDMQ operand operand operand evex_deco
+   | VMOVDQA64 operand operand evex_deco
+   | VMOVDQU64 operand operand evex_deco
+   // AVX-512 opmask instructions. Operands are mask registers k0-k7, which are
+   // not part of the operand type, so they are recorded as raw 3-bit indices
+   // (dest, src, then src2 or imm8).
+   | KXNORW (3 word) (3 word) (3 word)
+   | KSHIFTRW (3 word) (3 word) (8 word)
+   | KSHIFTLW (3 word) (3 word) (8 word)
    | VZEROUPPER
    | XCHG operand operand
    | XOR operand operand";;
