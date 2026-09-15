@@ -2756,6 +2756,100 @@ let simd_src3 = define
   (simd_src3 Broadcast (full:(x86state,N word)component) (src:operand) s =
      rvalue (word_duplicate (read (OPERAND32 src s) s) :N word))`;;
 
+let x86_VPTERNLOGQ = new_definition
+ `x86_VPTERNLOGQ dest src2 src3 ibyte masking (s:x86state) =
+        let a:N word = read dest s
+        and b:N word = read src2 s
+        and c:N word = read src3 s
+        and imm:byte = read ibyte s in
+        let t0 = if bit 0 imm then word_and (word_not a) (word_and (word_not b) (word_not c)) else word 0
+        and t1 = if bit 1 imm then word_and (word_not a) (word_and (word_not b) c) else word 0
+        and t2 = if bit 2 imm then word_and (word_not a) (word_and b (word_not c)) else word 0
+        and t3 = if bit 3 imm then word_and (word_not a) (word_and b c) else word 0
+        and t4 = if bit 4 imm then word_and a (word_and (word_not b) (word_not c)) else word 0
+        and t5 = if bit 5 imm then word_and a (word_and (word_not b) c) else word 0
+        and t6 = if bit 6 imm then word_and a (word_and b (word_not c)) else word 0
+        and t7 = if bit 7 imm then word_and a (word_and b c) else word 0 in
+        let z = word_or t0 (word_or t1 (word_or t2 (word_or t3
+                (word_or t4 (word_or t5 (word_or t6 t7)))))) in
+        (dest := apply_evex_masking_qword masking z a s) s`;;
+
+let x86_VPXORQ = new_definition
+ `x86_VPXORQ dest src1 src2 masking (s:x86state) =
+        let a:N word = read dest s
+        and x:N word = read src1 s
+        and y:N word = read src2 s in
+        let z = word_xor x y in
+        (dest := apply_evex_masking_qword masking z a s) s`;;
+
+let x86_VPROLQ = new_definition
+ `x86_VPROLQ dest src imm8 masking (s:x86state) =
+        let a:N word = read dest s
+        and x:N word = read src s
+        and c = val (read imm8 s) in
+        let z:N word =
+          if dimindex(:N) = 512
+          then word_zx(usimd8 (\(y:64 word). word_rol y c) (word_zx x:512 word))
+          else if dimindex(:N) = 256
+          then word_zx(usimd4 (\(y:64 word). word_rol y c) (word_zx x:256 word))
+          else word_zx(usimd2 (\(y:64 word). word_rol y c) (word_zx x:128 word)) in
+        (dest := apply_evex_masking_qword masking z a s) s`;;
+
+let x86_VMOVDQ64 = new_definition
+ `x86_VMOVDQ64 dest src masking (s:x86state) =
+        let a:N word = read dest s
+        and x:N word = read src s in
+        (dest := apply_evex_masking_qword masking x a s) s`;;
+
+let x86_VSHUFI64X2 = new_definition
+ `x86_VSHUFI64X2 dest src1 src2 imm8 (s:x86state) =
+        let a:N word = read src1 s
+        and b:N word = read src2 s
+        and c:byte = read imm8 s in
+        if dimindex(:N) = 512 then
+          let x:512 word = word_zx a and y:512 word = word_zx b in
+          let d0 = word_subword x (128 * val(word_subword c (0,2):2 word),128):int128
+          and d1 = word_subword x (128 * val(word_subword c (2,2):2 word),128):int128
+          and d2 = word_subword y (128 * val(word_subword c (4,2):2 word),128):int128
+          and d3 = word_subword y (128 * val(word_subword c (6,2):2 word),128):int128 in
+          let res:512 word =
+            word_join (word_join d3 d2:256 word) (word_join d1 d0:256 word) in
+          (dest := (word_zx res):N word) s
+        else
+          let x:256 word = word_zx a and y:256 word = word_zx b in
+          let d0 = word_subword x (128 * bitval(bit 0 c),128):int128
+          and d1 = word_subword y (128 * bitval(bit 1 c),128):int128 in
+          let res:256 word = word_join d1 d0 in
+          (dest := (word_zx res):N word) s`;;
+
+let x86_VINSERTI32X4 = new_definition
+ `x86_VINSERTI32X4 dest src1 src2 imm8 (s:x86state) =
+        let a:N word = read src1 s
+        and b:128 word = read src2 s
+        and c:byte = read imm8 s in
+        if dimindex(:N) = 512 then
+          let x:512 word = word_zx a and sel = val(word_subword c (0,2):2 word) in
+          let lane = (\i. if i = sel then b
+                          else word_subword x (128*i,128):int128) in
+          let res:512 word =
+            word_join (word_join (lane 3) (lane 2):256 word)
+                      (word_join (lane 1) (lane 0):256 word) in
+          (dest := (word_zx res):N word) s
+        else
+          let x:256 word = word_zx a in
+          let lo = if bit 0 c then word_subword x (0,128):int128 else b
+          and hi = if bit 0 c then b else word_subword x (128,128):int128 in
+          let res:256 word = word_join hi lo in
+          (dest := (word_zx res):N word) s`;;
+
+let x86_VEXTRACTI32X4 = new_definition
+ `x86_VEXTRACTI32X4 dest src imm8 (s:x86state) =
+        let a:N word = read src s
+        and c:byte = read imm8 s in
+        let sel = if dimindex(:N) = 512 then val(word_subword c (0,2):2 word)
+                  else bitval(bit 0 c) in
+        (dest := (word_subword (word_zx a:512 word) (128*sel,128):128 word)) s`;;
+
 (* ------------------------------------------------------------------------- *)
 (* Stating assumptions about instruction decoding                            *)
 (* ------------------------------------------------------------------------- *)
@@ -3966,6 +4060,59 @@ let x86_execute = define
         (\s. (match operand_size dest with
           256 -> x86_VPUNPCKLQDQ (OPERAND256 dest s) (OPERAND256 src1 s) (OPERAND256 src2 s)
         | 128 -> x86_VPUNPCKLQDQ (OPERAND128 dest s) (OPERAND128 src1 s) (OPERAND128 src2 s)) s)) s
+    | VPTERNLOGQ dest src2 src3 imm8 (Evex_deco masking brc) ->
+        (add_load_event dest s ,, add_load_event src2 s ,,
+         add_load_event src3 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VPTERNLOGQ (OPERAND512 dest s) (OPERAND512 src2 s)
+                   (OPERAND512 src3 s) (OPERAND8 imm8 s) masking
+        | 256 -> x86_VPTERNLOGQ (OPERAND256 dest s) (OPERAND256 src2 s)
+                   (OPERAND256 src3 s) (OPERAND8 imm8 s) masking
+        | 128 -> x86_VPTERNLOGQ (OPERAND128 dest s) (OPERAND128 src2 s)
+                   (OPERAND128 src3 s) (OPERAND8 imm8 s) masking) s)) s
+    | VPXORQ dest src1 src2 (Evex_deco masking brc) ->
+        (add_load_event dest s ,, add_load_event src1 s ,,
+         add_load_event src2 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VPXORQ (OPERAND512 dest s) (OPERAND512 src1 s)
+                   (OPERAND512 src2 s) masking
+        | 256 -> x86_VPXORQ (OPERAND256 dest s) (OPERAND256 src1 s)
+                   (OPERAND256 src2 s) masking
+        | 128 -> x86_VPXORQ (OPERAND128 dest s) (OPERAND128 src1 s)
+                   (OPERAND128 src2 s) masking) s)) s
+    | VPROLQ dest src imm8 (Evex_deco masking brc) ->
+        (add_load_event dest s ,, add_load_event src s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VPROLQ (OPERAND512 dest s) (OPERAND512 src s) (OPERAND8 imm8 s) masking
+        | 256 -> x86_VPROLQ (OPERAND256 dest s) (OPERAND256 src s) (OPERAND8 imm8 s) masking
+        | 128 -> x86_VPROLQ (OPERAND128 dest s) (OPERAND128 src s) (OPERAND8 imm8 s) masking) s)) s
+    | VMOVDQA64 dest src (Evex_deco masking brc) ->
+        (add_load_event dest s ,, add_load_event src s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VMOVDQ64 (OPERAND512 dest s) (OPERAND512 src s) masking
+        | 256 -> x86_VMOVDQ64 (OPERAND256 dest s) (OPERAND256 src s) masking
+        | 128 -> x86_VMOVDQ64 (OPERAND128 dest s) (OPERAND128 src s) masking) s)) s
+    | VMOVDQU64 dest src (Evex_deco masking brc) ->
+        (add_load_event dest s ,, add_load_event src s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VMOVDQ64 (OPERAND512 dest s) (OPERAND512 src s) masking
+        | 256 -> x86_VMOVDQ64 (OPERAND256 dest s) (OPERAND256 src s) masking
+        | 128 -> x86_VMOVDQ64 (OPERAND128 dest s) (OPERAND128 src s) masking) s)) s
+    | VSHUFI64X2 dest src1 src2 imm8 ->
+        (add_load_event src1 s ,, add_load_event src2 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VSHUFI64X2 (OPERAND512 dest s) (OPERAND512 src1 s) (OPERAND512 src2 s) (OPERAND8 imm8 s)
+        | 256 -> x86_VSHUFI64X2 (OPERAND256 dest s) (OPERAND256 src1 s) (OPERAND256 src2 s) (OPERAND8 imm8 s)) s)) s
+    | VINSERTI32X4 dest src1 src2 imm8 ->
+        (add_load_event src1 s ,, add_load_event src2 s ,, add_store_event dest s ,,
+        (\s. (match operand_size dest with
+          512 -> x86_VINSERTI32X4 (OPERAND512 dest s) (OPERAND512 src1 s) (OPERAND128 src2 s) (OPERAND8 imm8 s)
+        | 256 -> x86_VINSERTI32X4 (OPERAND256 dest s) (OPERAND256 src1 s) (OPERAND128 src2 s) (OPERAND8 imm8 s)) s)) s
+    | VEXTRACTI32X4 dest src imm8 ->
+        (add_load_event src s ,, add_store_event dest s ,,
+        (\s. (match operand_size src with
+          512 -> x86_VEXTRACTI32X4 (OPERAND128 dest s) (OPERAND512 src s) (OPERAND8 imm8 s)
+        | 256 -> x86_VEXTRACTI32X4 (OPERAND128 dest s) (OPERAND256 src s) (OPERAND8 imm8 s)) s)) s
     | VZEROUPPER ->
         x86_VZEROUPPER s
     | XCHG dest src ->
@@ -5107,6 +5254,7 @@ let x86_VPSRAW_ALT = EXPAND_SIMD_RULE x86_VPSRAW;;
 let x86_VPSRLW_ALT = EXPAND_SIMD_RULE x86_VPSRLW;;
 let x86_VPUNPCKHQDQ_ALT = EXPAND_SIMD_RULE x86_VPUNPCKHQDQ;;
 let x86_VPUNPCKLQDQ_ALT = EXPAND_SIMD_RULE x86_VPUNPCKLQDQ;;
+let x86_VPROLQ_ALT = EXPAND_SIMD_RULE x86_VPROLQ;;
 
 let X86_OPERATION_CLAUSES =
   map (CONV_RULE (TOP_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) o
@@ -5139,6 +5287,8 @@ let X86_OPERATION_CLAUSES =
     x86_VPUNPCKLQDQ_ALT; x86_VPUNPCKHQDQ_ALT; x86_VPBROADCASTQ_ALT; x86_VPERM2I128_ALT;
     x86_VMOVMSKPS_ALT; x86_VPABSD_ALT; x86_VPMOVMSKB_ALT; x86_VPMOVSXBD_ALT;
     x86_VPMOVZXBD_ALT; x86_VPMOVZXBW_ALT; x86_VPSUBB_ALT; x86_VPTEST_ALT; x86_VZEROUPPER_ALT;
+    x86_VPTERNLOGQ; x86_VPXORQ; x86_VPROLQ_ALT; x86_VMOVDQ64;
+    x86_VSHUFI64X2; x86_VINSERTI32X4; x86_VEXTRACTI32X4;
     (*** 32/8-bit backups since the ALT forms are 64-bit only ***)
     INST_TYPE[`:32`,`:N`] x86_ADC;
     INST_TYPE[`:32`,`:N`] x86_ADCX;

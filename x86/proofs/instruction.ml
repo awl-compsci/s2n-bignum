@@ -455,6 +455,14 @@ let instruction_INDUCTION,instruction_RECURSION = define_type
    | VPUNPCKHQDQ operand operand operand
    | VPUNPCKLQDQ operand operand operand
    | VPXOR operand operand operand
+   | VSHUFI64X2 operand operand operand operand
+   | VINSERTI32X4 operand operand operand operand
+   | VEXTRACTI32X4 operand operand operand
+   | VPTERNLOGQ operand operand operand operand evex_deco
+   | VPXORQ operand operand operand evex_deco
+   | VPROLQ operand operand operand evex_deco
+   | VMOVDQA64 operand operand evex_deco
+   | VMOVDQU64 operand operand evex_deco
    | VZEROUPPER
    | XCHG operand operand
    | XOR operand operand";;

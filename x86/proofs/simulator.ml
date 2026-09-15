@@ -1242,6 +1242,29 @@ let iclasses = iclasses_regreg @
  [0xc4; 0xe3; 0x5d; 0x44; 0xeb; 0x01]; (* VPCLMULQDQ (%_% ymm5) (%_% ymm4) (%_% ymm3) (Imm8 (word 1)) *)
  [0xc4; 0x43; 0x09; 0x44; 0xef; 0x11]; (* VPCLMULQDQ (%_% xmm13) (%_% xmm14) (%_% xmm15) (Imm8 (word 17)) *)
  [0xc4; 0x43; 0x0d; 0x44; 0xfd; 0x10]; (* VPCLMULQDQ (%_% ymm15) (%_% ymm14) (%_% ymm13) (Imm8 (word 16)) *)
+] @
+(*** AVX-512 4x Keccak-f1600 instruction set (register operands) ***)
+[
+  [0x62; 0xf3; 0xf5; 0x48; 0x25; 0xc2; 0x96]; (* vpternlogq $0x96,zmm2,zmm1,zmm0 *)
+  [0x62; 0x23; 0xa5; 0x4b; 0x25; 0xf4; 0xd2]; (* vpternlogq $0xd2,zmm20,zmm11,zmm30{k3} *)
+  [0x62; 0xf1; 0xf5; 0x48; 0xef; 0xc2];       (* vpxorq zmm2,zmm1,zmm0 *)
+  [0x62; 0x21; 0xa5; 0x49; 0xef; 0xf4];       (* vpxorq zmm20,zmm11,zmm30{k1} *)
+  [0x62; 0x71; 0xbd; 0xca; 0xef; 0xcf];       (* vpxorq zmm7,zmm8,zmm9{k2}{z} *)
+  [0x62; 0xf1; 0xe5; 0x48; 0x72; 0xc8; 0x01]; (* vprolq $1,zmm0,zmm3 *)
+  [0x62; 0x91; 0xfd; 0x44; 0x72; 0xcf; 0x11]; (* vprolq $17,zmm31,zmm16{k4} *)
+  [0x62; 0x71; 0xfd; 0x48; 0x6f; 0xed];       (* vmovdqa64 zmm5,zmm13 *)
+  [0x62; 0x01; 0xfd; 0x49; 0x6f; 0xd1];       (* vmovdqa64 zmm25,zmm26{k1} *)
+  [0x62; 0x71; 0xfe; 0xcd; 0x6f; 0xed];       (* vmovdqu64 zmm5,zmm13{k5}{z} *)
+  [0x62; 0xf3; 0xe5; 0x28; 0x43; 0xe2; 0x01]; (* vshufi64x2 $1,ymm2,ymm3,ymm4 *)
+  [0x62; 0x93; 0x95; 0x20; 0x43; 0xf9; 0x02]; (* vshufi64x2 $2,ymm25,ymm29,ymm7 *)
+  [0x62; 0xf3; 0xe5; 0x48; 0x43; 0xe2; 0xb1]; (* vshufi64x2 $0xb1,zmm2,zmm3,zmm4 *)
+  [0x62; 0xa3; 0xdd; 0x40; 0x43; 0xf2; 0x39]; (* vshufi64x2 $0x39,zmm18,zmm20,zmm22 *)
+  [0x62; 0xf3; 0x65; 0x28; 0x38; 0xe2; 0x01]; (* vinserti32x4 $1,xmm2,ymm3,ymm4 *)
+  [0x62; 0x93; 0x15; 0x20; 0x38; 0xf9; 0x00]; (* vinserti32x4 $0,xmm25,ymm29,ymm7 *)
+  [0x62; 0xf3; 0x65; 0x48; 0x38; 0xe2; 0x03]; (* vinserti32x4 $3,xmm2,zmm3,zmm4 *)
+  [0x62; 0xf3; 0x7d; 0x28; 0x39; 0xdc; 0x01]; (* vextracti32x4 $1,ymm3,xmm4 *)
+  [0x62; 0x83; 0x7d; 0x48; 0x39; 0xe1; 0x02]; (* vextracti32x4 $2,zmm20,xmm25 *)
+  [0x62; 0x92; 0xfd; 0x28; 0x59; 0xf9]        (* vpbroadcastq xmm25,ymm7 (EVEX) *)
 ];;
 
 (* ------------------------------------------------------------------------- *)
@@ -1321,6 +1344,45 @@ let extra_movsb_tac =
      TOP_DEPTH_CONV COMPONENT_READ_OVER_WRITE_CONV)) THEN
   ASM_REWRITE_TAC[] THEN STRIP_TAC;;
 
+let WORD_OF_BITS_DWORD_CONV tm =
+  match tm with
+  | Comb(Const("word_of_bits",_), setspec)
+       when can (find_term (fun t -> match t with
+              | Comb(Const("word",_),n) when is_numeral n -> true | _ -> false))
+                setspec
+         && can (find_term (fun t -> match t with
+              | Comb(Comb(Const("DIV",_),_),_) -> true | _ -> false)) setspec ->
+    let mty = hd(snd(dest_type(type_of tm))) in
+    let m = Num.int_of_num(dest_finty mty) in
+    let nt = find_term (fun t -> match t with
+       | Comb(Const("word",_),n) when is_numeral n -> true | _ -> false) setspec in
+    let n = dest_numeral (rand nt) in
+    let divt = find_term (fun t -> match t with
+       | Comb(Comb(Const("DIV",_),_),d) when is_numeral d -> true | _ -> false)
+       setspec in
+    let lanew = Num.int_of_num(dest_numeral (rand divt)) in
+    let k = ref num_0 in
+    for i = m-1 downto 0 do
+      let maskbit =
+        Num.mod_num (Num.quo_num n (power_num (num 2) (num (i/lanew)))) (num 2) in
+      k := Num.add_num (Num.mult_num (num 2) !k) maskbit
+    done;
+    let rhstm = mk_comb(inst [mty,`:N`] `word:num->(N)word`, mk_numeral !k) in
+    prove(mk_eq(tm, rhstm),
+      ONCE_REWRITE_TAC[WORD_EQ_BITS_ALT] THEN
+      CONV_TAC(ONCE_DEPTH_CONV DIMINDEX_CONV) THEN
+      CONV_TAC(ONCE_DEPTH_CONV EXPAND_CASES_CONV) THEN
+      REWRITE_TAC[BIT_WORD_OF_BITS; IN_ELIM_THM] THEN
+      CONV_TAC(ONCE_DEPTH_CONV DIMINDEX_CONV) THEN
+      CONV_TAC NUM_REDUCE_CONV THEN
+      CONV_TAC(DEPTH_CONV BIT_WORD_CONV) THEN CONV_TAC NUM_REDUCE_CONV)
+  | _ -> failwith "WORD_OF_BITS_DWORD_CONV";;
+
+let evex_mask_tac =
+  CONV_TAC(ONCE_DEPTH_CONV WORD_OF_BITS_DWORD_CONV) THEN
+  CONV_TAC(DEPTH_CONV WORD_RED_CONV) THEN
+  ASM_REWRITE_TAC[];;
+
 let tac_before memop =
   REWRITE_TAC[NONOVERLAPPING_CLAUSES] THEN STRIP_TAC THEN
   REWRITE_TAC[regfile; CONS_11; FLAGENCODING_11; VAL_WORD_GALOIS] THEN
@@ -1364,6 +1426,7 @@ and tac_after memop =
   (if memop then CONV_TAC(ONCE_DEPTH_CONV READ_MEMORY_FULLMERGE_CONV)
    else ALL_TAC) THEN
   ASM_REWRITE_TAC[] THEN extra_simp_tac THEN
+  evex_mask_tac THEN
   (if memop then CONV_TAC(ONCE_DEPTH_CONV READ_MEMORY_FULLMERGE_CONV)
    else ALL_TAC) THEN
   ASM_REWRITE_TAC[] THEN extra_simp_tac THEN
