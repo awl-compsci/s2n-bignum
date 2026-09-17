@@ -323,6 +323,10 @@ let decode = new_definition `!w:int32. decode w =
   | [0b11010101000000110010000000011111:32] ->
     SOME arm_NOP
 
+  // BTI c (hint #34), the AARCH64_VALID_CALL_TARGET landing pad; see arm_BTI
+  | [0b11010101000000110010010001011111:32] ->
+    SOME arm_BTI
+
   // SIMD ld,st operations
   // LDR/STR (immediate, SIMD&FP), Unsigned offset, no writeback
   // Currently only supports sizes 128 and 64 (not 32, 16 or 8)
@@ -416,10 +420,12 @@ let decode = new_definition `!w:int32. decode w =
     SOME (arm_ldst_q is_ld Rt (XREG_SP Rn) No_Offset)
 
   // LD1/ST1 (multiple structures), 2 registers,
-  //   Post-index with immediate offset, datasize = 128
+  //   Post-immediate offset and post-register offset, datasize = 128
   // Similar to LDP of SIMD registers, assuming little-endian architecture.
-  | [0:1; 1:1; 0b0011001:7; is_ld; 0:1; 0b11111:5; 0b1010:4; size:2; Rn:5; Rt:5] ->
-    SOME (arm_ldstp_2q is_ld Rt (XREG_SP Rn) (Postimmediate_Offset (word 32)))
+  | [0:1; 1:1; 0b0011001:7; is_ld; 0:1; Rm:5; 0b1010:4; size:2; Rn:5; Rt:5] ->
+    SOME (arm_ldstp_2q is_ld Rt (XREG_SP Rn)
+      (if val Rm = 31 then (Postimmediate_Offset (word 32))
+                      else Postreg_Offset (XREG' Rm)))
   //   No offset, datasize = 128
   | [0:1; 1:1; 0b0011000:7; is_ld; 0b000000:6; 0b1010:4; size:2; Rn:5; Rt:5] ->
     SOME (arm_ldstp_2q is_ld Rt (XREG_SP Rn) No_Offset)
@@ -1820,6 +1826,32 @@ let define_from_elf name file =
 
 let define_assert_from_elf name file =
   define_assert_word_list name (term_of_bytes (load_elf_contents_arm file));;
+
+(*** Define a variant with the initial BTI landing pad trimmed away ***)
+
+(* Arm counterpart of the x86 `define_trimmed`. Defines
+   `<name> = TRIM_LIST(4,0)(<mc>)`, i.e. the code with its leading `BTI c`
+   removed, so one proof can cover both the default and a -DNO_IBT build.
+   Simpler than the x86 version: aarch64 has no RIP-relative addressing and
+   encodes branches relatively, so dropping the first instruction needs no
+   displacement fixup inside the bytelist. Only the plain `mc = [bytes]` shape
+   is supported; a pc-parameterised mc theorem is rejected rather than
+   mishandled. *)
+
+let define_trimmed =
+  let trim_tm = `TRIM_LIST(4,0):byte list->byte list`
+  and bl_ty = `:byte list` in
+  fun name th ->
+    let avs,_ = strip_forall(concl th) in
+    if avs <> [] then
+      failwith ("define_trimmed: " ^ name ^
+                ": pc-parameterised mc theorems are not supported")
+    else
+      let eth = CONV_RULE(RAND_CONV TRIM_LIST_CONV) (AP_TERM trim_tm th) in
+      let ldef =
+        try mk_mconst(name,bl_ty) with Failure _ -> mk_var(name,bl_ty) in
+      let def' = mk_eq(ldef,lhand(concl eth)) in
+      TRANS (new_definition def') eth;;
 
 let print_literal_from_elf file =
   let bs = load_elf_contents_arm file in
