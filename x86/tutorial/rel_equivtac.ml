@@ -227,9 +227,9 @@ let equiv_goal = mk_equiv_statement_simple
   pxor_eq  (* Input state equivalence *)
   pxor_eq (* Output state equivalence *)
   pxor_mc PXOR_EXEC  (* First program machine code *)
-  `MAYCHANGE [RIP] ,, MAYCHANGE [YMM1_SSE]`
+  `MAYCHANGE [RIP] ,, MAYCHANGE [ZMM1]`
   pxor_mc PXOR_EXEC (* Second program machine code *)
-  `MAYCHANGE [RIP] ,, MAYCHANGE [YMM1_SSE]`;;
+  `MAYCHANGE [RIP] ,, MAYCHANGE [ZMM1]`;;
 
 
 (* Given `read XMM{n}_SSE s0 = rhs`, this rule proves
@@ -259,10 +259,49 @@ let EXPAND_READ_XMM_SSE_RULE th =
   with Failure _ -> failwith ("Could not expand " ^ (string_of_thm th));;
 
 
+(* word_join a (word_join b c) = word_join (word_join a b) c : re-associate so
+   the outer split of the 512-bit write is [384-bit upper | 128-bit low], i.e.
+   so ABBREV_READS_TAC's single word_join peel lands on the constrained low 128. *)
+let WJ_REASSOC = WORD_BLAST
+  `!(a:(256)word) (b:(128)word) (c:(128)word).
+      word_join a (word_join b c:(256)word):(512)word =
+      word_join (word_join a b:(384)word) c`;;
+
+(* From `read YMMn s = word_join u rhs`, reconstruct the full 512-bit read
+   `read ZMMn s = word_join (X:384) rhs`, exposing the untouched upper 384 bits
+   as an opaque ghost X while keeping the low 128 bits `rhs` (the value the spec
+   constrains). *)
+let YMM_TO_ZMM_EXISTSTOP = prove
+ (`!c (s:S) (u:(128)word) (rhs:(128)word).
+      read (c :> zerotop_256) s = word_join u rhs
+      ==> ?X:(384)word. read c s = word_join X rhs`,
+  REPEAT STRIP_TAC THEN
+  RULE_ASSUM_TAC(REWRITE_RULE[READ_ZEROTOP_256]) THEN
+  EXISTS_TAC `word_subword (read c (s:S):(512)word) (128,384):(384)word` THEN
+  SUBGOAL_THEN `word_subword (read c (s:S):(512)word) (0,128):(128)word = rhs`
+    (fun th -> GEN_REWRITE_TAC (RAND_CONV o RAND_CONV) [SYM th]) THENL
+   [GEN_REWRITE_TAC LAND_CONV
+      [WORD_BLAST `!(z:(512)word). word_subword z (0,128):(128)word =
+                     word_subword (word_zx z:(256)word) (0,128)`] THEN
+    ASM_REWRITE_TAC[] THEN CONV_TAC WORD_BLAST;
+    CONV_TAC WORD_BLAST]);;
+
+(* Replace every `read YMMn s = word_join _ rhs` hypothesis with its
+   reconstructed `read ZMMn s = word_join (ghost:384) rhs`. *)
+let ZMM_EXISTSTOP_ALL:tactic =
+  let rule y = REWRITE_RULE (map GSYM
+       [YMM0; YMM1; YMM2; YMM3; YMM4; YMM5; YMM6; YMM7;
+        YMM8; YMM9; YMM10; YMM11; YMM12; YMM13; YMM14; YMM15])
+      (ISPEC y YMM_TO_ZMM_EXISTSTOP) in
+  REPEAT (FIRST_X_ASSUM(fun th ->
+    let zth = tryfind (fun r -> MATCH_MP (rule r) th) [`ZMM1`; `ZMM2`; `ZMM3`] in
+    X_CHOOSE_THEN (genvar `:(384)word`) ASSUME_TAC zth));;
+
 let org_extra_word_conv = !extra_word_CONV;;
 
 (* Enable simplification of word_subwords by default *)
-extra_word_CONV := [WORD_SIMPLE_SUBWORD_CONV] @ !extra_word_CONV;;
+extra_word_CONV := [WORD_SIMPLE_SUBWORD_CONV;
+                    GEN_REWRITE_CONV I [WJ_REASSOC]] @ !extra_word_CONV;;
 
 (* Now, let's prove the program equivalence. *)
 let EQUIV = prove(equiv_goal,
@@ -274,19 +313,24 @@ let EQUIV = prove(equiv_goal,
   EQUIV_INITIATE_TAC pxor_eq THEN
   REPEAT (FIRST_X_ASSUM
     (fun th -> MP_TAC (EXPAND_READ_XMM_SSE_RULE th) THEN STRIP_TAC)) THEN
+  (* Reconstruct the full 512-bit ZMM reads with an opaque upper ghost so the
+     "equal" lockstep can abbreviate the shared low 128 bits. *)
+  ZMM_EXISTSTOP_ALL THEN
 
   EQUIV_STEPS_TAC [
     ("equal",0,2,0,2);
   ] PXOR_EXEC PXOR_EXEC THEN
 
   REPEAT_N 2 ENSURES_FINAL_STATE_TAC THEN
-  (* Prove remaining clauses from the postcondition *)
+  (* Prove remaining clauses from the postcondition; the MAYCHANGE [ZMM1] frame
+     is discharged here (no CONJ_TAC needed). *)
   ASM_REWRITE_TAC[] THEN
 
-  (* No CONJ_TAC this time, because MAYCHANGE part was already discharged! *)
-  ASM_REWRITE_TAC([pxor_eq] @ [XMM1_SSE; XMM2_SSE; XMM3_SSE; READ_BOTTOM_128] @
-      READ_YMM_SSE_EQUIV) THEN
-  CONV_TAC (ONCE_DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
+  (* Output equivalence: each XMM{n}_SSE low half is the shared value. *)
+  REWRITE_TAC[pxor_eq; XMM1_SSE; XMM2_SSE; XMM3_SSE;
+              YMM1_SSE; YMM2_SSE; YMM3_SSE; READ_BOTTOM_128; READ_BOTTOM_256] THEN
+  ASM_REWRITE_TAC[] THEN
+  CONV_TAC (DEPTH_CONV WORD_SIMPLE_SUBWORD_CONV) THEN
   MESON_TAC[]);;
 
 
