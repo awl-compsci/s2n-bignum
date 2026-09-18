@@ -1391,6 +1391,14 @@ let MLDSA_POLY_USE_HINT_88_BLOCK_CORRECT = prove
   REWRITE_TAC[C_ARGUMENTS; NONOVERLAPPING_CLAUSES; ALL;
               fst MLDSA_POLY_USE_HINT_88_EXEC] THEN
   DISCH_THEN(REPEAT_TCL CONJUNCTS_THEN ASSUME_TAC) THEN REWRITE_TAC[SOME_FLAGS] THEN
+  (* Loop invariant.  The VPBROADCASTD constant registers are pinned at their
+     512-bit ZMM values.  Each literal below is the concrete numeral for
+     word_zx (word_duplicate (word c:int32):int256):(512)word -- the 32-bit
+     constant c broadcast to all 8 lanes, zero-extended to ZMM.  It is written
+     as the numeral (rather than that intent-form term) because the downstream
+     store/wrapper discharges match on the numeral shape.  The constants are:
+       ZMM8 = 11275   ZMM4 = 127   ZMM7 = 128
+       ZMM6 = 43   ZMM3 = 8285184   ZMM5 = 0. *)
   ENSURES_WHILE_PUP_TAC `32` `pc + 0x52` `pc + 0xd7`
    `\i s.
       (read RDI s = word_add a (word(32 * i)) /\
