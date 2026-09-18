@@ -18,6 +18,20 @@
 needs "x86/proofs/base.ml";;
 needs "common/mlkem_mldsa.ml";;
 
+(* Pattern D (ZMM view): collapse the read-ZMM word_zx round-trips (widen then
+   narrow back to the original width) that wrap each stored SIMD result, so the
+   store-fold / lemma matches downstream see the plain form.  No-op under YMM. *)
+let ZMM_STORE_ZX_COLLAPSE_TAC : tactic =
+  RULE_ASSUM_TAC(SIMP_RULE[WORD_ZX_ZX;
+    DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
+    DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+    ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
+    ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
+    ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+    ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
+    ARITH_RULE `16 <= 512`]);;
+
+
 (* ZMM view: local SIMD_SIMPLIFY_TAC whose simdable gate also matches 512-bit
    ZMM reads (upstream only fires on read X s:int256), so the straight-line
    body can reduce the word_zx-wrapped broadcast-constant / mulhi reads that
@@ -1257,17 +1271,7 @@ let MLDSA_DECOMPOSE_32_CORRECT = prove(
     SIMD_SIMPLIFY_TAC_ZMM[decompose_32_a1; decompose_32_a0]) (1--399) THEN
   ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
   RULE_ASSUM_TAC(REWRITE_RULE[WORD_NOT_JOIN_256; WORD_NOT_JOIN_128; WORD_NOT_JOIN_64]) THEN
-  (* ZMM view: collapse the read-ZMM word_zx round-trips (widen-to-512 then
-     narrow-back) wrapping each stored 256-bit value so the bytes256 fold and
-     the DECOMPOSE_32_* lemma matches below succeed.  No-op under the YMM view. *)
-  RULE_ASSUM_TAC(SIMP_RULE[WORD_ZX_ZX;
-           DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
-           DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
-           ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
-           ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
-           ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
-           ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
-           ARITH_RULE `16 <= 512`]) THEN
+  ZMM_STORE_ZX_COLLAPSE_TAC THEN
   (* ZMM view: now that the word_zx wrapper is gone, re-run the WORD_NOT_JOIN
      distribution so the sign-mask word_not(word_join ...) pushes down to the
      per-lane word_not before the bytes256 fold below (under the YMM view the

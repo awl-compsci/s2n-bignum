@@ -12,6 +12,21 @@
 needs "x86/proofs/base.ml";;
 needs "common/mlkem_mldsa.ml";;
 
+(* Pattern D (ZMM view): collapse the read-ZMM word_zx round-trips (widen then
+   narrow back to the original width) that wrap each stored SIMD result, so the
+   fold lemmas downstream see the plain form.  Goal-directed variant.  No-op
+   under YMM. *)
+let ZMM_STORE_ZX_COLLAPSE_TAC : tactic =
+  SIMP_TAC[WORD_ZX_ZX;
+    DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
+    DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+    ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
+    ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
+    ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+    ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
+    ARITH_RULE `16 <= 512`];;
+
+
 (**** print_literal_from_elf "x86/mldsa/mldsa_chknorm.o";;
  ****)
 
@@ -326,17 +341,7 @@ let MLDSA_CHKNORM_CORRECT = prove(
   RULE_ASSUM_TAC(REWRITE_RULE
     [WORD_BLAST `(word_zx:int64->int32)((word_zx:int32->int64) x) = x`]) THEN
   ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
-  (* ZMM view: collapse the read-ZMM word_zx round-trips (widen-then-narrow back
-     to the original width) that wrap each lane value, so the fold lemmas below
-     see the plain int256 form.  No-op under the YMM view. *)
-  SIMP_TAC[WORD_ZX_ZX;
-           DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
-           DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
-           ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
-           ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
-           ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
-           ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
-           ARITH_RULE `16 <= 512`] THEN
+  ZMM_STORE_ZX_COLLAPSE_TAC THEN
   (* ZMM view: now that the word_zx round-trips are gone, re-run the lane
      canonicalization (push word_or through word_join to the mask leaves) that the
      per-step RULE_ASSUM couldn't fire while the reads were word_zx-wrapped, so the

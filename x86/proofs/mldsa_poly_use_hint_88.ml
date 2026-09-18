@@ -12,6 +12,20 @@
 needs "x86/proofs/base.ml";;
 needs "common/mlkem_mldsa.ml";;
 
+(* Pattern D (ZMM view): collapse the read-ZMM word_zx round-trips (widen then
+   narrow back to the original width) that wrap each stored SIMD result, so the
+   store-fold / lemma matches downstream see the plain form.  No-op under YMM. *)
+let ZMM_STORE_ZX_COLLAPSE_TAC : tactic =
+  RULE_ASSUM_TAC(SIMP_RULE[WORD_ZX_ZX;
+    DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
+    DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+    ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
+    ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
+    ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+    ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
+    ARITH_RULE `16 <= 512`]);;
+
+
 (* ZMM view: local SIMD_SIMPLIFY_TAC whose simdable gate also matches 512-bit
    ZMM reads, so the block body reduces the word_zx-wrapped constant reads. *)
 let SIMD_SIMPLIFY_TAC_ZMM unfold_defs =
@@ -1327,14 +1341,7 @@ let MLDSA_POLY_USE_HINT_88_BODY_BLOCK_TAC : tactic =
     ANTS_TAC THENL [ASM_ARITH_TAC; DISCH_THEN ACCEPT_TAC]; ALL_TAC] THEN
   EVERY (map (fun n -> X86_STEPS_TAC MLDSA_POLY_USE_HINT_88_EXEC [n] THEN SIMD_SIMPLIFY_TAC_ZMM[] THEN ABBREV_BIG_TAC_ZMM) (1--28)) THEN
   ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
-  RULE_ASSUM_TAC(SIMP_RULE[WORD_ZX_ZX;
-      DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
-      DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
-      ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
-      ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
-      ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
-      ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
-      ARITH_RULE `16 <= 512`]) THEN
+  ZMM_STORE_ZX_COLLAPSE_TAC THEN
   REPEAT CONJ_TAC THEN
   TRY(REWRITE_TAC[ARITH_RULE `32 * (i + 1) = 32 * i + 32`] THEN CONV_TAC WORD_RULE) THEN
   TRY(X_GEN_TAC `b:num` THEN DISCH_TAC THEN ASM_CASES_TAC `b < i` THENL

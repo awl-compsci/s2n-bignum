@@ -17,6 +17,20 @@
 needs "x86/proofs/base.ml";;
 needs "common/mlkem_mldsa.ml";;
 
+(* Pattern D (ZMM view): collapse the read-ZMM word_zx round-trips (widen then
+   narrow back to the original width) that wrap each stored SIMD result, so the
+   store-fold / lemma matches downstream see the plain form.  No-op under YMM. *)
+let ZMM_STORE_ZX_COLLAPSE_TAC : tactic =
+  RULE_ASSUM_TAC(SIMP_RULE[WORD_ZX_ZX;
+    DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
+    DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
+    ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
+    ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
+    ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
+    ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
+    ARITH_RULE `16 <= 512`]);;
+
+
 (**** print_literal_from_elf "x86/mldsa/mldsa_polyz_unpack_19.o";;
  ****)
 
@@ -830,17 +844,7 @@ let MLDSA_POLYZ_UNPACK_19_CORRECT = prove
 
   ENSURES_FINAL_STATE_TAC THEN ASM_REWRITE_TAC[] THEN
 
-  (* ZMM view: collapse the read-ZMM word_zx round-trips (widen-to-512 then
-     narrow-back) wrapping each stored 256-bit value so the POLYZ19_STORE fold
-     below matches the plain word_join form.  No-op under the YMM view. *)
-  RULE_ASSUM_TAC(SIMP_RULE[WORD_ZX_ZX;
-           DIMINDEX_8; DIMINDEX_16; DIMINDEX_32; DIMINDEX_64;
-           DIMINDEX_128; DIMINDEX_256; DIMINDEX_512;
-           ARITH_RULE `32 <= 64`; ARITH_RULE `32 <= 128`; ARITH_RULE `32 <= 256`;
-           ARITH_RULE `32 <= 512`; ARITH_RULE `64 <= 128`; ARITH_RULE `64 <= 256`;
-           ARITH_RULE `64 <= 512`; ARITH_RULE `128 <= 256`; ARITH_RULE `128 <= 512`;
-           ARITH_RULE `256 <= 512`; ARITH_RULE `256 <= 256`; ARITH_RULE `8 <= 512`;
-           ARITH_RULE `16 <= 512`]) THEN
+  ZMM_STORE_ZX_COLLAPSE_TAC THEN
 
   (* Fold each 256-bit store into 8 atomic zunpack19 lanes *)
   RULE_ASSUM_TAC(CONV_RULE(TRY_CONV(RAND_CONV
