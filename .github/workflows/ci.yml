@@ -85,40 +85,37 @@ jobs:
   s2n-bignum-sematest:
     strategy:
       matrix:
-        arch: [arm, x86]
+        arch: [x86]
 
-    runs-on: ${{ matrix.arch == 'arm' && 'ubuntu-24.04-arm' || matrix.arch == 'x86' && 'ubuntu-24.04' }}
+    # fork-CI: x86 sematest on the self-hosted AVX-512 runner
+    runs-on: avx512-x86
+    timeout-minutes: 1440
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install dependent packages
+    - name: Install HOL Light (cached on self-hosted runner)
       run: |
-        sudo apt update
-        sudo apt install libpcre2-dev ocaml libstring-shellquote-perl libgmp-dev xdot
-        wget https://raw.githubusercontent.com/ocaml/opam/master/shell/install.sh
-        chmod +x install.sh
-        echo "/usr/local/bin" | sh ./install.sh --version 2.5.2
-        opam init --disable-sandboxing
+        set -e
+        HOLDIR="$HOME/hol-light-ci"
+        if [ ! -f "$HOLDIR/hol_lib.cmo" ]; then
+          rm -rf "$HOLDIR"
+          git clone https://github.com/jrh13/hol-light.git "$HOLDIR"
+          cd "$HOLDIR"
+          git checkout ${{ env.HOLLIGHT_COMMIT }}
+          make switch-5
+          eval $(opam env)
+          HOLLIGHT_USE_MODULE=1 make
+        fi
+        echo "HOLDIR=$HOLDIR" >> "$GITHUB_ENV"
 
-    - name: Install HOL Light
+    - name: Run sematest
       run: |
-        git clone https://github.com/jrh13/hol-light.git
-        cd hol-light
-        git checkout ${{ env.HOLLIGHT_COMMIT }}
-        make switch-5
+        set -e
         eval $(opam env)
-        echo $(ocamlc -version)
-        echo $(camlp5 -v)
-        HOLLIGHT_USE_MODULE=1 make
-        cd ..
-
-    - name: Run tests
-      run: |
-        export HOLDIR=`pwd`/hol-light
-        cd ${{ matrix.arch }}
-        make sematest
+        cd x86
+        make sematest NUM_CORES_FOR_SEMATEST=2
 
   s2n-bignum-cross-sematest:
     strategy:
@@ -325,45 +322,50 @@ jobs:
         cd arm
         make tutorial -j2
 
+  # fork-CI: scoped AVX-512 proofs on the self-hosted AVX-512 runner.
+  # Runs only the vector proofs this stack touches (34 targets), in the
+  # tree state of whichever commit the PR is on. Intermediate commits keep
+  # the not-yet-migrated proofs green via x86_ymm_view := true; the full
+  # library suite is validated locally on the tip.
   s2n-bignum-proofs:
     strategy:
         matrix:
-          arch: [arm, x86]
-    runs-on:
-      - codebuild-s2n-bignum-github-actions-${{ github.run_id }}-${{ github.run_attempt }}
+          arch: [x86]
+    runs-on: avx512-x86
+    timeout-minutes: 1440
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install dependent packages
+    - name: Install HOL Light (cached on self-hosted runner)
       run: |
-        sudo apt --allow-insecure-repositories update
-        sudo apt -y install libpcre2-dev ocaml binutils-aarch64-linux-gnu binutils-aarch64-linux-gnu binutils-x86-64-linux-gnu libstring-shellquote-perl libgmp-dev xdot
-        wget https://raw.githubusercontent.com/ocaml/opam/master/shell/install.sh
-        chmod +x install.sh
-        echo "/usr/local/bin" | sh ./install.sh --version 2.5.2
-        opam init --disable-sandboxing
+        set -e
+        HOLDIR="$HOME/hol-light-ci"
+        if [ ! -f "$HOLDIR/hol_lib.cmo" ]; then
+          rm -rf "$HOLDIR"
+          git clone https://github.com/jrh13/hol-light.git "$HOLDIR"
+          cd "$HOLDIR"
+          git checkout ${{ env.HOLLIGHT_COMMIT }}
+          make switch-5
+          eval $(opam env)
+          HOLLIGHT_USE_MODULE=1 make
+        fi
+        echo "HOLDIR=$HOLDIR" >> "$GITHUB_ENV"
 
-    - name: Install HOL Light
+    - name: Run scoped AVX-512 proofs
       run: |
-        git clone https://github.com/jrh13/hol-light.git
-        cd hol-light
-        git checkout ${{ env.HOLLIGHT_COMMIT }}
-        make switch-5
+        set -e
         eval $(opam env)
-        echo $(ocamlc -version)
-        echo $(camlp5 -v)
-        HOLLIGHT_USE_MODULE=1 make
-        cd ..
-
-    - name: Run proofs and tutorial
-      run: |
-        export HOLDIR=`pwd`/hol-light
-        export BUILD_CORE_COUNT=15
-        export CORE_COUNT=64
-        cd ${{ matrix.arch }}
-        make -j ${BUILD_CORE_COUNT} build_proofs build_tutorial
-        make -j ${CORE_COUNT} proofs tutorial
-        ../tools/collect-times.sh ${{ matrix.arch }}
+        cd x86
+        # Memory-heavy proofs (esp. keccak); keep parallelism modest on a 61GB box.
+        # Vector proofs this stack touches. Filter to those whose .ml exists at
+        # THIS commit (early commits lack keccak4vl/keccak8), module=<prefix>.
+        NAMES="mldsa_chknorm mldsa_decompose_32 mldsa_decompose_88 mldsa_intt mldsa_ntt mldsa_nttunpack mldsa_pointwise mldsa_pointwise_acc_l4 mldsa_pointwise_acc_l5 mldsa_pointwise_acc_l7 mldsa_poly_use_hint_32 mldsa_poly_use_hint_88 mldsa_polyz_unpack_17 mldsa_polyz_unpack_19 mldsa_reduce mldsa_rej_uniform_VARIABLE_TIME mldsa_rej_uniform_eta2_VARIABLE_TIME mldsa_rej_uniform_eta4_VARIABLE_TIME mlkem_basemul_k2 mlkem_basemul_k3 mlkem_basemul_k4 mlkem_frombytes mlkem_intt mlkem_mulcache_compute mlkem_ntt mlkem_reduce mlkem_rej_uniform_VARIABLE_TIME mlkem_tobytes mlkem_tomont mlkem_unpack sha3_keccak4_f1600 sha3_keccak4_f1600_alt sha3_keccak4_f1600_avx512vl sha3_keccak8_f1600_avx512"
+        TARGETS=""
+        for n in $NAMES; do
+          if [ -f "proofs/$n.ml" ]; then TARGETS="$TARGETS ${n%%_*}/$n.correct"; fi
+        done
+        echo "targets present at this commit:$TARGETS"
+        make -j 2 $TARGETS
 
