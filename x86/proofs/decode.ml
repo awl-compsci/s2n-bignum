@@ -165,12 +165,36 @@ let read_displacement = new_definition `read_displacement (md:2 word) l =
   | 2 -> read_int32 l >>= \(w,l). SOME(word_sx w,l)
   | _ -> NONE`;;
 
+(* --- EVEX compressed disp8 (a.k.a. "disp8*N") -------------------------------
+   For EVEX-encoded memory operands the 8-bit displacement form (ModRM mod=01)
+   stores a COMPRESSED displacement: the effective byte displacement is
+   (signed disp8) * N, where N is the operand's tuple-size factor. The 32-bit
+   displacement form (mod=10) and the no-displacement form (mod=00) are NOT
+   scaled. See Intel SDM Vol.2 2.6.5 "Compressed Displacement (disp8*N)" and
+   Table 2-34/2-35.
+
+   N is classified by SDM tuple type. `evex_tuple` enumerates the tuple types and
+   `evex_tuple_disp_scale tup w bcast sz` is the complete factor table (Tables
+   2-34/2-35): N as a function of the tuple type, the EVEX.W bit `w`, the
+   broadcast bit `bcast` and the vector length `sz`. The 0x62 decode dispatch
+   derives N by calling this table directly: VPTERNLOGD is a Full-tuple dword
+   instruction, so it passes `evex_tuple_disp_scale Full_Tuple F bcast sz` (= 4
+   for a dword broadcast, else the full vector size 16/32/64), which the scaled
+   ModRM reader multiplies into the disp8 to form the effective displacement.
+   Adding a non-Full EVEX instruction means its dispatch arm passes the
+   appropriate `evex_tuple` constructor here; any resulting N outside the
+   currently precomputed {4,16,32,64} also needs a matching READ_*_SCALED table
+   entry in the DECODE_CONV setup. *)
 let evex_tuple_INDUCT,evex_tuple_RECURSION = define_type
  "evex_tuple =
     Full_Tuple | Half_Tuple
   | Tuple1_Scalar_Byte | Tuple1_Scalar_Word | Tuple1_Scalar | Tuple1_Fixed
   | Tuple2 | Tuple4 | Tuple8
   | Full_Mem | Mem_128 | MovDDup | Half_Mem | Quarter_Mem | Eighth_Mem";;
+
+(* Complete SDM disp8*N tuple-factor table (Vol.2 Tables 2-34/2-35). Broadcast
+   rows use the element size (4 dword / 8 qword, by W); memory rows use fractions
+   of the vector length L in bytes (16/32/64 for 128/256/512-bit). *)
 let evex_tuple_disp_scale = define
  `(evex_tuple_disp_scale Full_Tuple w bcast sz =
      if bcast then (if w then 8 else 4)
@@ -196,6 +220,8 @@ let evex_tuple_disp_scale = define
      (match sz with Lower_128 -> 4 | Lower_256 -> 8 | Full_512 -> 16)) /\
   (evex_tuple_disp_scale Eighth_Mem w bcast sz =
      (match sz with Lower_128 -> 2 | Lower_256 -> 4 | Full_512 -> 8))`;;
+
+(* Like read_displacement but scales the disp8 case by n (disp32/disp0 as-is). *)
 let read_displacement_scaled = new_definition
  `read_displacement_scaled (n:num) (md:2 word) l =
   match val md with
@@ -203,6 +229,7 @@ let read_displacement_scaled = new_definition
   | 1 -> read_byte l >>= \(b,l). SOME(word_mul (word n) (word_sx b),l)
   | 2 -> read_int32 l >>= \(w,l). SOME(word_sx w,l)
   | _ -> NONE`;;
+
 let RM_INDUCTION,RM_RECURSION = define_type
  "RM = RM_reg (4 word) | RM_reg_evex (5 word) | RM_mem bsid";;
 
@@ -237,6 +264,7 @@ let read_SIB = define
      read_sib_displacement md bs l >>= \((d,b),l).
      SOME(Bsid b i s d, l))`;;
 
+(* EVEX variant of read_SIB using the disp8*N-scaled displacement reader. *)
 let read_SIB_scaled = define
  `read_SIB_scaled n rex md [] = NONE /\
   (!b l. read_SIB_scaled n rex md (CONS b l) =
@@ -267,6 +295,10 @@ let read_ModRM = define
      SOME((rex_reg (rex_R rex) reg,
            RM_mem (%%(Gpr (rex_reg (rex_B rex) rm) Full_64,val disp))), l))`;;
 
+(* EVEX variant of read_ModRM: identical structure, but memory displacements go
+   through the disp8*N-scaled readers. The register case (mod=11) and the
+   RIP-relative disp32 case (mod=00, rm=101) carry no scaled displacement, so
+   they are unchanged. *)
 let read_ModRM_scaled = define
  `read_ModRM_scaled n rex [] = NONE /\
   (!b l. read_ModRM_scaled n rex (CONS b l) =
@@ -337,6 +369,7 @@ let VEXM_INDUCTION,VEXM_RECURSION = define_type
 
 let EVEXM_INDUCTION,EVEXM_RECURSION = define_type
  "EVEXM = EVEXM_0F | EVEXM_0F38 | EVEXM_0F3A | EVEXM_MAP5 | EVEXM_MAP6";;
+
 let read_VEXM = new_definition `read_VEXM (m:5 word) =
   bitmatch m with
   | [1:5] -> SOME VEXM_0F
@@ -707,6 +740,236 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
     SOME (PUSH (%(Gpr (rex_reg (rex_B rex) r) Full_64)),l)
   | [0b01011:5; r:3] -> if has_pfxs pfxs then NONE else
     SOME (POP (%(Gpr (rex_reg (rex_B rex) r) Full_64)),l)
+  | [0x62:8] -> if has_pfxs pfxs then NONE else
+    if is_some rex then NONE else
+    read_EVEX l >>= \((rex,r',m,v,pfxs,z,LL,bcast,a),l).
+    evexL_size LL >>= \sz.
+    let masking = if a = word 0 then Unmasked
+                  else if z = word 1 then Zero_mask a
+                  else Merge_mask a in
+    let brc = if bcast then Broadcast else No_brc in
+    let deco = Evex_deco masking brc in
+    (match m with
+      EVEXM_0F3A ->
+        read_byte l >>= \(b,l).
+        (bitmatch b with
+        | [0x25:8] ->
+          // VPTERNLOGQ: qword, Full tuple, N = 64 (broadcast not modeled).
+          if rex_W rex then
+            read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+            read_imm Byte l >>= \(imm8,l).
+            (if bcast then NONE
+             else match pfxs with
+               | (T, Rep0, SG0) ->
+                 SOME (VPTERNLOGQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) imm8 deco,l)
+               | _ -> NONE)
+          else
+          read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple F bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          read_imm Byte l >>= \(imm8,l).
+          (if bcast then match rm with
+              RM_mem ea ->
+                (match pfxs with
+                 | (T, Rep0, SG0) ->
+                   SOME (VPTERNLOGD (mmreg reg sz) (mmreg v sz) (Memop Doubleword ea) imm8 deco,l)
+                 | _ -> NONE)
+            | _ -> NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VPTERNLOGD (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) imm8 deco,l)
+             | _ -> NONE)
+        // VSHUFI64X2 (W1, Full tuple), unmasked only  (EVEX.66.0F3A.W1 0x43)
+        | [0x43:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           read_imm Byte l >>= \(imm8,l).
+           (if bcast then NONE else if a = word 0 then
+             (match pfxs with
+              | (T, Rep0, SG0) ->
+                SOME (VSHUFI64X2 (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) imm8,l)
+              | _ -> NONE) else NONE)) else NONE
+        // VINSERTI32X4 (W0, Tuple4), src2 = xmm/m128, unmasked  (EVEX.66.0F3A.W0 0x38)
+        // The 128-bit r/m is built directly (mmreg/Memop) rather than via
+        // simd_of_RM Lower_128, whose evaluator path is not exercised elsewhere.
+        | [0x38:8] ->
+          if rex_W rex then NONE else
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple4 F bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           read_imm Byte l >>= \(imm8,l).
+           (if bcast then NONE else if a = word 0 then
+             (match pfxs with
+              | (T, Rep0, SG0) ->
+                (match rm with
+                 | RM_reg_evex r -> SOME (VINSERTI32X4 (mmreg reg sz) (mmreg v sz) (mmreg r Lower_128) imm8,l)
+                 | RM_mem ea -> SOME (VINSERTI32X4 (mmreg reg sz) (mmreg v sz) (Memop Word128 ea) imm8,l)
+                 | _ -> NONE)
+              | _ -> NONE) else NONE))
+        // VEXTRACTI32X4 (W0, Tuple4): dest = xmm/m128 (r/m), src = reg  (EVEX.66.0F3A.W0 0x39)
+        | [0x39:8] ->
+          if rex_W rex then NONE else
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple4 F bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           read_imm Byte l >>= \(imm8,l).
+           (if bcast then NONE else if a = word 0 then
+             (match pfxs with
+              | (T, Rep0, SG0) ->
+                (match rm with
+                 | RM_reg_evex r -> SOME (VEXTRACTI32X4 (mmreg r Lower_128) (mmreg reg sz) imm8,l)
+                 | RM_mem ea -> SOME (VEXTRACTI32X4 (Memop Word128 ea) (mmreg reg sz) imm8,l)
+                 | _ -> NONE)
+              | _ -> NONE) else NONE))
+        // VPINSRQ (W1, Tuple1_Scalar): src2 = m64, unmasked  (EVEX.66.0F3A.W1 0x22)
+        | [0x22:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple1_Scalar T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           read_imm Byte l >>= \(imm8,l).
+           (if bcast then NONE else if a = word 0 then
+             (if is_memop rm then
+               (match pfxs with
+                | (T, Rep0, SG0) ->
+                  SOME (VPINSRQ (mmreg reg Lower_128) (mmreg v Lower_128) (operand_of_RM Full_64 rm) imm8,l)
+                | _ -> NONE) else NONE) else NONE)) else NONE
+        // VPEXTRQ (W1, Tuple1_Scalar): dest = m64 (r/m), unmasked  (EVEX.66.0F3A.W1 0x16)
+        | [0x16:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple1_Scalar T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           read_imm Byte l >>= \(imm8,l).
+           (if bcast then NONE else if a = word 0 then
+             (if is_memop rm then
+               (match pfxs with
+                | (T, Rep0, SG0) ->
+                  SOME (VPEXTRQ (operand_of_RM Full_64 rm) (mmreg reg Lower_128) imm8,l)
+                | _ -> NONE) else NONE) else NONE)) else NONE
+        | _ -> NONE)
+    | EVEXM_0F38 ->
+        read_byte l >>= \(b,l).
+        (bitmatch b with
+        // VPROLVQ zmm1{k}, zmm2, zmm3/m  (EVEX.66.0F38.W1 0x15)
+        | [0x15:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          (if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VPROLVQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) deco,l)
+             | _ -> NONE)) else NONE
+        // VPERMQ (variable) zmm1{k}, zmm2, zmm3/m  (EVEX.66.0F38.W1 0x36)
+        | [0x36:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          (if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VPERMQV (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) deco,l)
+             | _ -> NONE)) else NONE
+        // VPBLENDMQ zmm1{k}, zmm2, zmm3/m  (EVEX.66.0F38.W1 0x64)
+        | [0x64:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          (if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VPBLENDMQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) deco,l)
+             | _ -> NONE)) else NONE
+        // VPBROADCASTQ (W1, Tuple1_Scalar): src = m64 or xmm, unmasked  (EVEX.66.0F38.W1 0x59)
+        | [0x59:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple1_Scalar T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           (if bcast then NONE else if a = word 0 then
+             (match pfxs with
+              | (T, Rep0, SG0) ->
+                (match rm with
+                 | RM_mem ea -> SOME (VPBROADCASTQ (mmreg reg sz) (Memop Quadword ea),l)
+                 | RM_reg_evex r -> SOME (VPBROADCASTQ (mmreg reg sz) (mmreg r Lower_128),l)
+                 | _ -> NONE)
+              | _ -> NONE) else NONE)) else NONE
+        | _ -> NONE)
+    | EVEXM_0F ->
+        read_byte l >>= \(b,l).
+        (bitmatch b with
+        // VMOVDQA64 (66) / VMOVDQU64 (F3) load: dest = reg, src = r/m
+        // (EVEX.0F.W1 0x6F).  Tuple type FVM (Full_Mem), N = 64 at zmm.
+        | [0x6F:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Mem T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          (if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VMOVDQA64 (mmreg reg sz) (simd_of_RM sz rm) deco,l)
+             | (F, RepZ, SG0) ->
+               SOME (VMOVDQU64 (mmreg reg sz) (simd_of_RM sz rm) deco,l)
+             | _ -> NONE)) else NONE
+        // VMOVDQA64 / VMOVDQU64 store: dest = r/m, src = reg
+        // (EVEX.0F.W1 0x7F).
+        | [0x7F:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Mem T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          (if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VMOVDQA64 (simd_of_RM sz rm) (mmreg reg sz) deco,l)
+             | (F, RepZ, SG0) ->
+               SOME (VMOVDQU64 (simd_of_RM sz rm) (mmreg reg sz) deco,l)
+             | _ -> NONE)) else NONE
+        // VPROLQ zmm1{k}, zmm2/m, imm8  (EVEX.66.0F.W1 0x72 /1)
+        | [0x72:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          read_imm Byte l >>= \(imm8,l).
+          (let r3:3 word = word_zx reg in
+           if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               (bitmatch r3 with
+                | [0b001:3] -> SOME (VPROLQ (mmreg v sz) (simd_of_RM sz rm) imm8 deco,l)
+                | _ -> NONE)
+             | _ -> NONE)) else NONE
+        // VPXORQ zmm1{k}, zmm2, zmm3/m  (EVEX.66.0F.W1 0xEF)
+        | [0xEF:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+          (if bcast then NONE
+           else match pfxs with
+             | (T, Rep0, SG0) ->
+               SOME (VPXORQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm) deco,l)
+             | _ -> NONE)) else NONE
+        // VPUNPCKLQDQ (W1, Full tuple), unmasked  (EVEX.66.0F.W1 0x6C)
+        | [0x6C:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           (if bcast then NONE else if a = word 0 then
+             (match pfxs with
+              | (T, Rep0, SG0) ->
+                SOME (VPUNPCKLQDQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm),l)
+              | _ -> NONE) else NONE)) else NONE
+        // VPUNPCKHQDQ (W1, Full tuple), unmasked  (EVEX.66.0F.W1 0x6D)
+        | [0x6D:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Full_Tuple T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           (if bcast then NONE else if a = word 0 then
+             (match pfxs with
+              | (T, Rep0, SG0) ->
+                SOME (VPUNPCKHQDQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm),l)
+              | _ -> NONE) else NONE)) else NONE
+        // VMOVQ load (W1, Tuple1_Scalar): dest = xmm, src = m64, unmasked  (EVEX.66.0F.W1 0x6E)
+        | [0x6E:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple1_Scalar T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           (if bcast then NONE else if a = word 0 then
+             (if is_memop rm then
+               (match pfxs with
+                | (T, Rep0, SG0) ->
+                  SOME (VMOVQ (mmreg reg Lower_128) (operand_of_RM Full_64 rm),l)
+                | _ -> NONE) else NONE) else NONE)) else NONE
+        // VMOVQ store (W1, Tuple1_Scalar): dest = m64 (r/m), src = xmm, unmasked  (EVEX.66.0F.W1 0x7E)
+        | [0x7E:8] ->
+          if rex_W rex then
+          (read_EVEX_ModRM (evex_tuple_disp_scale Tuple1_Scalar T bcast sz) rex r' (rex_X rex) l >>= \((reg,rm),l).
+           (if bcast then NONE else if a = word 0 then
+             (if is_memop rm then
+               (match pfxs with
+                | (T, Rep0, SG0) ->
+                  SOME (VMOVQ (operand_of_RM Full_64 rm) (mmreg reg Lower_128),l)
+                | _ -> NONE) else NONE) else NONE)) else NONE
+        | _ -> NONE)
+    | _ -> NONE)
   | [0x63:8] -> if has_pfxs pfxs then NONE else
     let sz2 = op_size_W rex T pfxs in
     read_ModRM rex l >>= \((reg,rm),l).
@@ -940,6 +1203,19 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
     | VEXM_0F ->
         read_byte l >>= \(b,l).
         (bitmatch b with
+        // KXNORW k1, k2, k3  (VEX.L1.0F.W0 0x46): dst = ModRM.reg,
+        // src1 = VEX.vvvv, src2 = ModRM.rm (all opmask registers).
+        | [0x46:8] ->
+          (read_ModRM rex l >>= \((reg,rm),l).
+           if rex_W rex then NONE else
+           match rm with
+           | RM_reg r ->
+             (match pfxs with
+              | (F, Rep0, SG0) ->
+                if L then SOME (KXNORW (word_zx reg) (word_zx v) (word_zx r),l)
+                else NONE
+              | _ -> NONE)
+           | _ -> NONE)
         | [0x12:8] ->
           let sz = vexL_size L in
           (read_ModRM rex l >>= \((reg,rm),l).
@@ -1141,7 +1417,7 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
            match pfxs with
            | (T, Rep0, SG0) -> SOME (VPSUBQ (mmreg reg sz) (mmreg v sz) (simd_of_RM sz rm),l)
            | _ -> NONE)
-        | [0xfc:8] ->
+        | [0xfc:8] -> 
           let sz = vexL_size L in
           (read_ModRM rex l >>= \((reg,rm),l).
            match pfxs with
@@ -1246,6 +1522,35 @@ let decode_aux = new_definition `!pfxs rex l. decode_aux pfxs rex l =
     | VEXM_0F3A ->
         read_byte l >>= \(b,l).
         (bitmatch b with
+        // KSHIFTRW k1, k2, imm8  (VEX.L0.66.0F3A.W1 0x30): dst = ModRM.reg,
+        // src = ModRM.rm (opmask registers), imm8 = shift count.
+        | [0x30:8] ->
+          (read_ModRM rex l >>= \((reg,rm),l).
+           read_byte l >>= \(imm8,l).
+           if rex_W rex then
+           (match rm with
+            | RM_reg r ->
+              (match pfxs with
+               | (T, Rep0, SG0) ->
+                 if L then NONE
+                 else SOME (KSHIFTRW (word_zx reg) (word_zx r) imm8,l)
+               | _ -> NONE)
+            | _ -> NONE)
+           else NONE)
+        // KSHIFTLW k1, k2, imm8  (VEX.L0.66.0F3A.W1 0x32).
+        | [0x32:8] ->
+          (read_ModRM rex l >>= \((reg,rm),l).
+           read_byte l >>= \(imm8,l).
+           if rex_W rex then
+           (match rm with
+            | RM_reg r ->
+              (match pfxs with
+               | (T, Rep0, SG0) ->
+                 if L then NONE
+                 else SOME (KSHIFTLW (word_zx reg) (word_zx r) imm8,l)
+               | _ -> NONE)
+            | _ -> NONE)
+           else NONE)
         | [0x00:8] ->
           let sz = vexL_size L in
           (read_ModRM rex l >>= \((reg,rm),l).
@@ -1877,13 +2182,13 @@ let OPERAND_OF_RM_CONV =
   | _ -> failwith "OPERAND_OF_RM_CONV";;
 
 let SIMD_OF_RM_CONV =
-  let conv1 =
+  let conv1 =                                                (* RM_reg *)
     GEN_REWRITE_CONV I [CONJUNCT1 simd_of_RM] THENC
     RAND_CONV(LAND_CONV WORD_ZX_CONV THENC SIMDREG_CONV)
-  and conv1e =
+  and conv1e =                                               (* RM_reg_evex *)
     GEN_REWRITE_CONV I [CONJUNCT1(CONJUNCT2 simd_of_RM)] THENC
     RAND_CONV(LAND_CONV WORD_ZX_CONV THENC SIMDREG_CONV)
-  and conv2 =
+  and conv2 =                                                (* RM_mem *)
     GEN_REWRITE_CONV I [CONJUNCT2(CONJUNCT2 simd_of_RM)] THENC
     LAND_CONV SIMD_TO_WORDSIZE_CONV in
   fun tm -> match tm with
@@ -2018,6 +2323,9 @@ let mk_sib_disp_thm =
       let reg' = mk_comb (word4, mk_numeral (num reg)) in
       CONV_RULE conv (INST [reg',`reg:4 word`] th);;
 
+(* Scaled (disp8*N) analogues, parameterized by the concrete tuple factor n.
+   Same shape as read_disp_thms / mk_sib_disp_thm, but the disp8 case carries a
+   `word_mul (word n) (word_sx b)`; WORD_RED_CONV folds it once b is concrete. *)
 let read_disp_scaled_thms =
   let word2 = mk_const ("word", [`:2`,`:N`]) in
   let th = CONV_RULE (BINDER_CONV(BINDER_CONV(BINDER_CONV(RAND_CONV MATCH_CONV'))))
@@ -2185,13 +2493,15 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
     ref (fun _ -> failwith "evaluate read_SIB failed")
   and modRM_table = (* overwritten below *)
     Array.make 256 (fun _ -> failwith "evaluate read_ModRM failed")
-  and disp_scaled_funcs =
+  (* EVEX disp8*N-scaled analogues, keyed by the concrete tuple factor n.
+     Populated lazily (one entry per distinct n encountered). *)
+  and disp_scaled_funcs = (* n -> (md -> ...) *)
     ref ([]: (int * (term -> (term*term)list -> thm)) list)
-  and sib_disp_scaled_funcs =
+  and sib_disp_scaled_funcs = (* n -> (md -> reg -> ...) *)
     ref ([]: (int * (term -> term -> (term*term)list -> thm)) list)
-  and sib_scaled_funcs =
+  and sib_scaled_funcs = (* n -> (... -> thm) *)
     ref ([]: (int * ((term*term)list -> thm)) list)
-  and modRM_scaled_tables =
+  and modRM_scaled_tables = (* n -> 256-entry table *)
     ref ([]: (int * ((term*term)list -> thm) array) list)
   and read_vex_func = (* overwritten below *)
     ref ((fun _ -> failwith "evaluate read_VEX failed"),
@@ -2233,18 +2543,30 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
     REWRITE_CONV [evex_tuple_disp_scale] THENC
     REWRITE_CONV [COND_CLAUSES] THENC
     TOP_DEPTH_CONV MATCH_CONV in
+
+  (* The tuple factor reaches the scaled CONVs either as a numeral or as an
+     unreduced `evex_tuple_disp_scale tup w bcast sz` term (all args concrete);
+     fold the latter first. *)
   let scale_num n =
     if is_numeral n then n else rhs (concl (EVEX_DISP_SCALE_CONV n)) in
   let scale_of n = Num.int_of_num (dest_numeral (scale_num n)) in
+  (* The scaled readers appear in the term with n = `evex_tuple_disp_scale ...`
+     (unreduced) but the precomputed tables are keyed by the numeral. Fold n to
+     the numeral, look up the table for the numeric-n form, then rebuild the
+     result with the ORIGINAL n on the left (so the deferred-eval machinery can
+     discharge it). `reroot n g` does this: g produces `f <numeral n> .. = rhs`;
+     we return `f n .. = rhs`. *)
   let reroot n resth =
     if is_numeral n then resth else
-    let neq = EVEX_DISP_SCALE_CONV n in
-    let lhs0 = lhs (concl resth) in
+    let neq = EVEX_DISP_SCALE_CONV n in       (* neq : n = <numeral> *)
+    let lhs0 = lhs (concl resth) in           (* f <numeral> a1 .. ak *)
+    (* args applied on top of `f <numeral>`; head = `f`, first arg = numeral *)
     let rec strip acc t = match t with
       | Comb(g,a) -> strip (a::acc) g
       | _ -> t, acc in
-    let head, args = strip [] lhs0 in
+    let head, args = strip [] lhs0 in         (* head = f const; args = num::rest *)
     let rest = tl args in
+    (* f n a1 .. ak = f <numeral> a1 .. ak *)
     let lhseq = rev_itlist (fun a th -> AP_THM th a)
                   rest (AP_TERM head neq) in
     TRANS lhseq resth in
@@ -2270,6 +2592,7 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
                 .(Num.int_of_num (dest_numeral a))
                 [rex,`rex:(4 word)option`; l,`l:byte list`])
   | _ -> failwith "READ_MODRM_SCALED_CONV" in
+
   let READ_VEX_CONV = function
   | Comb(Comb(Const("read_VEX",_),Const("T",_)),l) ->
     fst !read_vex_func [l,`l:byte list`]
@@ -2514,6 +2837,8 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
           PROVE_HYP (REFL e2) (g ls)
         | _ -> failwith "match EVEXM failed")
     else if ty = `:RM` then
+      (* RM constructors carry arguments, so each pattern binds a fresh
+         variable that we unify against the actual value at apply time. *)
       let pats = map (fun c ->
           let aty = fst (dest_fun_ty (type_of c)) in
           mk_comb (c, genvar aty))
@@ -2527,6 +2852,9 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
           match rhs (concl th) with
           | Const("NONE",_) -> ls
           | r -> (try (repeat rator pat, (pat, evaluate r (F o TRANS th))) :: ls
+                  (* A constructor with no clause in this match leaves a stuck
+                     residual that evaluate rejects; such patterns are simply
+                     not reachable here, so skip them. *)
                   with Failure _ | Invalid_argument _ -> ls) in
       let gs = C assoc (go pats) in
       fun ls ->
@@ -2549,6 +2877,9 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
   | Comb((Const("decode_condition",_) as f),a) ->
     eval_unary f a F DECODE_CONDITION_CONV
   | Comb(Comb((Const("word_mul",_) as f),a),b) ->
+      (* EVEX compressed disp8 scaling: word_mul (word N) (word_sx b). Use
+         TRY_CONV so it is a no-op while b is still symbolic (during the
+         symbolic table build) and folds once b is a concrete byte. *)
       eval_binary f a b F (TRY_CONV WORD_RED_CONV)
   | Comb((Const("word_zx",_) as f),a) -> eval_unary f a F WORD_ZX_34_CONV
   | Comb((Const("word_sx",_) as f),a) -> eval_unary f a F
@@ -2593,6 +2924,10 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
     let th = pth_evex l in
     evaluate (rhs (concl th)) (F o TRANS th)
   | Comb(Comb(Comb(Comb(Comb(Const("read_EVEX_ModRM",_),n),rex),r'),x),l) ->
+    (* Unfold read_EVEX_ModRM with the tuple factor n as-is (it is a symbolic
+       `evex_tuple_disp_scale Full_Tuple F bcast sz` during the symbolic table build). The body's
+       scaled readers defer via eval_opt; their conversions fold n to a numeral
+       at apply time while keeping the term's LHS intact so it discharges. *)
     let th = pth_evex_modrm n rex r' x l in
     evaluate (rhs (concl th)) (F o TRANS th)
   | Comb(Comb(Comb(Comb(Const("read_sib_displacement_scaled",_),_),_),_),_) ->
@@ -2624,6 +2959,9 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
   | Comb(Comb((Const("rex_reg",_) as f),a),b) ->
     eval_binary f a b F REX_REG_CONV
   | Comb((Const(("rex_B"|"rex_X"|"rex_R"|"rex_W"),_) as f),a) ->
+    (* REX_BIT_CONV only reduces a concrete rex (NONE or SOME(word n)).
+       In the EVEX path the rex is built as SOME(<deferred>), so defer
+       the reduction until the argument is instantiated. *)
     log_step "rex_bit [e]" evaluate a (fun th ->
       let th = AP_TERM f th in
       let tm = rhs (concl th) in
@@ -2796,12 +3134,14 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
   (* returned function fills those holes via INST.                          *)
   (* --------------------------------------------------------------------- *)
   let () =
-    let ns = [4; 8; 16; 32; 64] in
+    let ns = [4; 8; 16; 32; 64] in  (* 8 = Tuple1_Scalar W1 *)
+    (* read_displacement_scaled: md -> ... *)
     disp_scaled_funcs := map (fun n ->
       let A = Array.init 3 (fun md ->
         let th = read_disp_scaled_thms n md in
         evaluate (rhs (concl th)) (C INST o TRANS th)) in
       n, fun md -> A.(Num.int_of_num (dest_numeral md))) ns;
+    (* read_sib_displacement_scaled: md -> reg -> ... *)
     sib_disp_scaled_funcs := map (fun n ->
       let A = Array.init 3 (fun md ->
         let f = mk_sib_disp_scaled_thm n md in
@@ -2810,10 +3150,12 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
       n, fun md reg ->
         A.(Num.int_of_num (dest_numeral md))
          .(Num.int_of_num (dest_numeral reg))) ns;
+    (* read_SIB_scaled: recurse via the deferred sib-disp CONV *)
     sib_scaled_funcs := map (fun n ->
       let th = INST [mk_numeral (num n),`n:num`]
                  (SPEC_ALL (CONJUNCT2 read_SIB_scaled)) in
       n, evaluate (rhs (concl th)) (C INST o TRANS th)) ns;
+    (* read_ModRM_scaled: 256-entry table per n, recursing via deferred CONVs *)
     modRM_scaled_tables := map (fun n ->
       let pth = INST [mk_numeral (num n),`n:num`]
                   (SPEC_ALL (CONJUNCT2 read_ModRM_scaled)) in
@@ -2831,6 +3173,7 @@ let READ_SIB_CONV,READ_MODRM_CONV,READ_VEX_CONV,DECODE_CONV =
         with Failure _ as e -> fun _ -> raise e)
       done;
       n, tbl) ns in
+
   let decode_table =
     let rex,pfxs,t = `rex:(4 word)option`,`pfxs:pfxs`,`t:byte list`
     and f = C INST o MATCH_MP decode'_of_aux in
@@ -3101,6 +3444,8 @@ let add_ll_tac,LL_TAC =
         let e = lhand (body (rand g)) in
         match type_of e with
         | Tyapp("RM",[]) ->
+          (* RM_INDUCTION yields one conjunct per constructor (RM_reg,
+             RM_reg_evex, RM_mem); simplify the match in every conjunct. *)
           SPEC_TAC (e, mk_var("x", type_of e)) THEN
           MATCH_MP_TAC RM_INDUCTION THEN
           CONV_TAC (BINOP2_CONV ((BINDER_CONV o RAND_CONV o BINDER_CONV) MATCH_CONV')
@@ -3259,6 +3604,7 @@ let list_linear_read_EVEX_ModRM = (add_ll_opt o prove)
  (`!n rex r' x. list_linear_f (read_EVEX_ModRM n rex r' x)`,
   UNETA_TAC `read_EVEX_ModRM n rex r' x l` THEN
   REWRITE_TAC [read_EVEX_ModRM] THEN REPEAT LL_TAC);;
+
 let list_linear_decode_aux = prove
  (`!pfxs rex h. list_linear_f (\l. decode_aux pfxs rex (CONS h l))`,
   REPEAT GEN_TAC THEN REWRITE_TAC [decode_aux; read_byte_val;
