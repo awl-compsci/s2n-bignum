@@ -11,9 +11,8 @@
 (* avx512vl: the shared keccak_1600_permute is inlined and its embedded      *)
 (* round-constant table is taken as a pointer argument (rsi), exactly as     *)
 (* the AVX2 kernel takes rc_pointer. State is register-resident in           *)
-(* ymm0..ymm24 (no stack spill), so the proof runs in the DEFAULT ZMM view   *)
-(* and the loop invariant carries 25 ymm reads instead of AVX2's             *)
-(* `[YMM5] ++ stack` form.                                                   *)
+(* ymm0..ymm24 (no stack spill), so the proof's loop invariant carries       *)
+(* 25 ymm reads instead of AVX2's `[YMM5] ++ stack` form.                    *)
 (*                                                                           *)
 (* C arguments: rdi = bitstate_in (4 states x 200 bytes), rsi = rc_pointer.  *)
 (* Offsets (post-trim tmc = mc - 4): entry 0x0; loop setup mov r10 @ 0x23a,  *)
@@ -23,13 +22,6 @@
 needs "x86/proofs/base.ml";;
 needs "x86/proofs/utils/keccak_spec.ml";;
 needs "common/mlkem_mldsa.ml";;  (* for SIMD_SIMPLIFY_TAC *)
-
-(* ZMM operand view: each 256-bit ymm operand
-   reads as word_zx(read ZMMk):512 -> we bound the resulting term bloat during
-   stepping with per-step SIMD_SIMPLIFY_TAC_LOCAL (cf mlkem_reduce), and carry
-   raw ZMM ghosts in the precondition so stepped reads survive DISCARD_OLDSTATE
-   (cf kec_unit_zmm). The discharge bridges read YMMk = word_zx(read ZMMk) via
-   READ_ZEROTOP_256; BITBLAST absorbs the word_zx. *)
 
 let sha3_keccak4_f1600_avx512vl_mc = define_assert_from_elf
   "sha3_keccak4_f1600_avx512vl_mc" "x86/sha3/sha3_keccak4_f1600_avx512vl.o"
@@ -820,6 +812,20 @@ let ZXCOLLAPSE_TAC : tactic =
   RULE_ASSUM_TAC(fun th ->
     if zx_collapsible (concl th) then CONV_RULE ZXCOLLAPSE th else th);;
 
+(* Theta vpternlogq (imm 0x96) DNF folded to XOR3 (shrinks BITBLAST terms ~37x). *)
+let XOR3_FOLD = prove
+ (`!a b c:int64. (~~a && ~~b && c) || (~~a && b && ~~c) || (a && ~~b && ~~c) ||
+                 (a && b && c) = a ^^ b ^^ c`,
+  REPEAT GEN_TAC THEN BITBLAST_TAC);;
+
+(* Per-output-bit BITBLAST with a Gc throttle: one tiny BDD per bit. *)
+let PERBIT_BITBLAST : tactic =
+  let cnt = ref 0 in
+  BITBLAST_THEN (fun vars ->
+    REPEAT CONJ_TAC THEN
+    W(fun (_,w) -> let th = prove(w, CONV_TAC(BDD_DEFTAUT vars)) in
+       incr cnt; (if !cnt mod 128 = 0 then Gc.compact()); ACCEPT_TAC th));;
+
 (* ------------------------------------------------------------------------- *)
 (* Prove-once/compose-per-buffer lane discharge.                             *)
 (* A round output int256 register holds the SAME keccak_round lane computed  *)
@@ -846,7 +852,7 @@ let LANE_TAC : tactic =
      let cs = conjuncts w in
      let g0 = hd cs in
      let b0 = find islist (frees g0) in
-     let th0 = prove(g0, BITBLAST_TAC) in
+     let th0 = prove(g0, REWRITE_TAC[XOR3_FOLD] THEN PERBIT_BITBLAST) in
      let thms = map (fun g ->
         if g = g0 then th0
         else let bg = find islist (frees g) in
